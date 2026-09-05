@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Renamed the independently maintained fork to `@treythomascodes/pi-subagent-lite`, preserving the original author and MIT license attribution.
+- Added an optional per-call `model` parameter using Pi's native `--model` selectors, with the requested model visible in the tool header and initial progress.
+- Preserved Pi's default model selection when `model` is omitted; blank selectors are rejected.
+- Fixed tool failure signaling and rendering so child-process/model errors are not reported as successful runs.
+- Updated installation instructions to use this fork and CI to use the minimum supported Node.js version.
 - Migrated Pi imports and peer dependencies to the `@earendil-works/pi-*` packages.
 - Raised the minimum Node.js version to 22.19 to match the current Pi packages.
 
