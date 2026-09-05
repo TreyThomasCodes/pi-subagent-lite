@@ -2,7 +2,7 @@
  * Minimal subagent extension
  *
  * Delegates a task to a fresh pi process with an isolated context window.
- * Optionally loads startup skills via --skill flags.
+ * Optionally selects a model via --model and loads startup skills via --skill flags.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -134,10 +134,17 @@ async function runSubagent(
 	cwd: string,
 	task: string,
 	skills: string[],
+	model?: string,
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult) => void,
 ): Promise<string> {
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	const modelSelector = model?.trim();
+	if (modelSelector !== undefined) {
+		if (!modelSelector) throw new Error("model must be a non-empty Pi model ID or provider/model selector");
+		// Let Pi resolve providers, shorthand matches, and thinking-level suffixes.
+		args.push("--model", modelSelector);
+	}
 
 	for (const skill of skills) {
 		args.push("--skill", skill);
@@ -146,7 +153,9 @@ async function runSubagent(
 	let tmpDir: string | null = null;
 
 	try {
-		onUpdate?.({ content: [{ type: "text", text: "Subagent running..." }] });
+		onUpdate?.({
+			content: [{ type: "text", text: modelSelector ? `Subagent running (${modelSelector})...` : "Subagent running..." }],
+		});
 
 		tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 		const promptFile = path.join(tmpDir, "prompt.md");
@@ -173,14 +182,20 @@ async function runSubagent(
 		let stderr = "";
 		let spawnError: Error | undefined;
 		let lastAssistantText = "";
+		let lastAssistantError: string | undefined;
 		let turnCount = 0;
 
 		const processLine = (line: string) => {
 			const message = parseMessageEnd(line);
 			if (!message || message.role !== "assistant") return;
 
+			// JSON mode may exit zero after a provider error. A later successful
+			// response clears the error if Pi's automatic retry recovers.
+			lastAssistantError = message.stopReason === "error" || message.stopReason === "aborted"
+				? message.errorMessage || `Subagent request ${message.stopReason}`
+				: undefined;
 			const text = getMessageText(message);
-			if (text) lastAssistantText = text;
+			if (text && !lastAssistantError) lastAssistantText = text;
 
 			if (onUpdate) {
 				turnCount++;
@@ -231,8 +246,9 @@ async function runSubagent(
 		if (signal?.aborted) throw new Error("Subagent aborted");
 
 		if (exitCode !== 0) {
-			throw spawnError ?? new Error(stderr.trim() || `Subagent exited with code ${exitCode}`);
+			throw spawnError ?? new Error(stderr.trim() || lastAssistantError || `Subagent exited with code ${exitCode}`);
 		}
+		if (lastAssistantError) throw new Error(lastAssistantError);
 
 		return lastAssistantText;
 	} finally {
@@ -248,6 +264,13 @@ async function runSubagent(
 
 const SubagentParams = Type.Object({
 	task: Type.String({ description: "Task to delegate to the subagent" }),
+	model: Type.Optional(
+		Type.String({
+			description: "Pi model selector passed to --model, preferably provider/model (e.g. anthropic/claude-haiku-4-5). Shorthand and :thinking suffixes are supported by Pi. Omit to use the child Pi process's configured default, not the parent session's active model.",
+			minLength: 1,
+			pattern: "\\S",
+		}),
+	),
 	skills: Type.Optional(
 		Type.Array(Type.String({ description: "Skill path or name to load via --skill" }), {
 			description: "Optional startup skills to load into the subagent process",
@@ -263,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. Optional startup skills can be preloaded.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. A model can be selected per call, and optional startup skills can be preloaded.",
 		promptSnippet: "Delegate a task to an isolated subagent process",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
@@ -271,22 +294,19 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			try {
-				const output = await runSubagent(ctx.cwd, params.task, params.skills ?? [], signal, onUpdate);
-				return {
-					content: [{ type: "text", text: output || "(no output)" }],
-				};
-			} catch (err: any) {
-				return {
-					content: [{ type: "text", text: err.message || String(err) }],
-					isError: true,
-				};
-			}
+			// Pi marks thrown errors as failed tool results; returning isError does not.
+			const output = await runSubagent(ctx.cwd, params.task, params.skills ?? [], params.model, signal, onUpdate);
+			return {
+				content: [{ type: "text", text: output || "(no output)" }],
+			};
 		},
 
 		renderCall(args, theme) {
-			const taskPreview = args.task.length > 60 ? args.task.slice(0, 60) + "..." : args.task;
+			const task = args.task ?? "";
+			const taskPreview = task.length > 60 ? task.slice(0, 60) + "..." : task;
 			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("dim", taskPreview);
+			const model = args.model?.trim();
+			if (model) text += ` ${theme.fg("accent", `[${model}]`)}`;
 			const skillsArr = args.skills ?? [];
 			if (skillsArr.length > 0) {
 				text += ` ${theme.fg("accent", `+${skillsArr.length} skills`)}`;
@@ -294,12 +314,12 @@ export default function (pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, options, theme) {
+		renderResult(result, options, theme, context) {
 			const output = result.content.find((c) => c.type === "text")?.text ?? "";
 			if (options.isPartial) {
 				return new Text(theme.fg("muted", output || "Subagent running..."), 0, 0);
 			}
-			const marker = theme.fg("success", "✓ ");
+			const marker = context.isError ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
 			const separator = theme.fg("muted", "--- Result ---");
 			const text = `${marker}${separator}\n${output}`;
 			return new Text(text, 0, 0);
