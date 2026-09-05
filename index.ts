@@ -15,6 +15,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 const MAX_TASK_ARG_LENGTH = 4000;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 const MINIMAL_SYSTEM_PROMPT = `You are a subagent running in an isolated pi process with access to file system and shell tools.
 
@@ -178,6 +180,7 @@ async function runSubagent(
 	task: string,
 	skills: string[],
 	model?: string,
+	thinking?: ThinkingLevel,
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult) => void,
 ): Promise<string> {
@@ -188,6 +191,7 @@ async function runSubagent(
 		// Let Pi resolve providers, shorthand matches, and thinking-level suffixes.
 		args.push("--model", modelSelector);
 	}
+	if (thinking) args.push("--thinking", thinking);
 
 	for (const skill of skills) {
 		args.push("--skill", skill);
@@ -196,8 +200,12 @@ async function runSubagent(
 	let tmpDir: string | null = null;
 
 	try {
+		const selection = [
+			modelSelector && `model: ${modelSelector}`,
+			thinking && `thinking: ${thinking}`,
+		].filter(Boolean).join(", ");
 		onUpdate?.({
-			content: [{ type: "text", text: modelSelector ? `Subagent running (${modelSelector})...` : "Subagent running..." }],
+			content: [{ type: "text", text: selection ? `Subagent running (${selection})...` : "Subagent running..." }],
 		});
 
 		tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
@@ -314,6 +322,11 @@ const SubagentParams = Type.Object({
 			pattern: "\\S",
 		}),
 	),
+	thinking: Type.Optional(
+		Type.Union(THINKING_LEVELS.map((level) => Type.Literal(level)), {
+			description: "Pi thinking level for the child model. Displayed with the selected model.",
+		}),
+	),
 	skills: Type.Optional(
 		Type.Array(Type.String({ description: "Skill path or name to load via --skill" }), {
 			description: "Optional startup skills to load into the subagent process",
@@ -355,7 +368,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			// Pi marks thrown errors as failed tool results; returning isError does not.
-			const output = await runSubagent(ctx.cwd, params.task, params.skills ?? [], params.model, signal, onUpdate);
+			const output = await runSubagent(ctx.cwd, params.task, params.skills ?? [], params.model, params.thinking, signal, onUpdate);
 			return {
 				content: [{ type: "text", text: output || "(no output)" }],
 			};
@@ -367,6 +380,7 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("dim", taskPreview);
 			const model = args.model?.trim();
 			if (model) text += ` ${theme.fg("accent", `[${model}]`)}`;
+			if (args.thinking) text += ` ${theme.fg("accent", `[thinking: ${args.thinking}]`)}`;
 			const skillsArr = args.skills ?? [];
 			if (skillsArr.length > 0) {
 				text += ` ${theme.fg("accent", `+${skillsArr.length} skills`)}`;
