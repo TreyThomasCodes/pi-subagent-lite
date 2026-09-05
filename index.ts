@@ -9,12 +9,14 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Message } from "@earendil-works/pi-ai";
 import { type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 const MAX_TASK_ARG_LENGTH = 4000;
+const MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
@@ -132,47 +134,244 @@ function terminateProcess(proc: ChildProcess): void {
 	proc.kill("SIGTERM");
 }
 
+type JsonRecord = Record<string, unknown>;
+
+type DiscoveredModel = {
+	selector: string;
+	provider: string;
+	model: string;
+	name: string;
+	api?: string;
+	capabilities: {
+		input: string[];
+		images: boolean;
+		reasoning: boolean;
+		thinkingLevels: ThinkingLevel[];
+		toolSupport: {
+			additionalTools: boolean;
+			grammarTools: boolean;
+			toolSearch: boolean;
+		};
+	};
+	limits: { contextTokens?: number; maxOutputTokens?: number };
+	pricing?: {
+		unit: "USD per million tokens";
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		tiers: Array<{ inputTokensAbove: number; input: number; output: number; cacheRead: number; cacheWrite: number }>;
+	};
+};
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function getThinkingLevels(model: JsonRecord): ThinkingLevel[] {
+	if (model.reasoning !== true) return ["off"];
+
+	const levelMap = isJsonRecord(model.thinkingLevelMap) ? model.thinkingLevelMap : {};
+	return THINKING_LEVELS.filter((level) => {
+		const mapped = levelMap[level];
+		if (mapped === null) return false;
+		if (level === "xhigh" || level === "max") return typeof mapped === "string";
+		return true;
+	});
+}
+
+function getPricing(value: unknown): DiscoveredModel["pricing"] {
+	if (!isJsonRecord(value)) return undefined;
+	const input = optionalNumber(value.input);
+	const output = optionalNumber(value.output);
+	const cacheRead = optionalNumber(value.cacheRead);
+	const cacheWrite = optionalNumber(value.cacheWrite);
+	if (input === undefined || output === undefined || cacheRead === undefined || cacheWrite === undefined) return undefined;
+
+	const tiers = Array.isArray(value.tiers)
+		? value.tiers.flatMap((tier) => {
+			if (!isJsonRecord(tier)) return [];
+			const inputTokensAbove = optionalNumber(tier.inputTokensAbove);
+			const tierInput = optionalNumber(tier.input);
+			const tierOutput = optionalNumber(tier.output);
+			const tierCacheRead = optionalNumber(tier.cacheRead);
+			const tierCacheWrite = optionalNumber(tier.cacheWrite);
+			return inputTokensAbove === undefined || tierInput === undefined || tierOutput === undefined || tierCacheRead === undefined || tierCacheWrite === undefined
+				? []
+				: [{ inputTokensAbove, input: tierInput, output: tierOutput, cacheRead: tierCacheRead, cacheWrite: tierCacheWrite }];
+		})
+		: [];
+	return { unit: "USD per million tokens", input, output, cacheRead, cacheWrite, tiers };
+}
+
+function normalizeDiscoveredModels(models: unknown[]): DiscoveredModel[] {
+	return models.flatMap((rawModel) => {
+		if (!isJsonRecord(rawModel)) return [];
+		const provider = optionalString(rawModel.provider);
+		const model = optionalString(rawModel.id);
+		if (!provider || !model) return [];
+
+		const input = Array.isArray(rawModel.input)
+			? rawModel.input.filter((type): type is string => typeof type === "string")
+			: [];
+		const compat = isJsonRecord(rawModel.compat) ? rawModel.compat : {};
+		return [{
+			selector: `${provider}/${model}`,
+			provider,
+			model,
+			name: optionalString(rawModel.name) ?? model,
+			api: optionalString(rawModel.api),
+			capabilities: {
+				input,
+				images: input.includes("image"),
+				reasoning: rawModel.reasoning === true,
+				thinkingLevels: getThinkingLevels(rawModel),
+				toolSupport: {
+					additionalTools: compat.supportsAdditionalTools === true,
+					grammarTools: compat.supportsOpenAIGrammarTools === true,
+					toolSearch: compat.supportsToolSearch === true,
+				},
+			},
+			limits: {
+				contextTokens: optionalNumber(rawModel.contextWindow),
+				maxOutputTokens: optionalNumber(rawModel.maxTokens),
+			},
+			pricing: getPricing(rawModel.cost),
+		}];
+	}).sort((a, b) => a.selector.localeCompare(b.selector));
+}
+
 async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<string> {
-	const invocation = getPiInvocation(["--list-models"]);
+	const requestId = "subagent-models";
+	const invocation = getPiInvocation(["--mode", "rpc", "--no-session"]);
 	const proc = spawn(invocation.command, invocation.args, {
 		cwd,
 		shell: false,
-		stdio: ["ignore", "pipe", "pipe"],
+		stdio: ["pipe", "pipe", "pipe"],
 		env: { ...process.env, PI_SUBAGENT_LITE_DISABLE: "true" },
 	});
 
-	let stdout = "";
+	let buffer = "";
 	let stderr = "";
+	let models: unknown[] | undefined;
+	let rpcError: string | undefined;
 	let spawnError: Error | undefined;
+	let stdinError: Error | undefined;
+	let timedOut = false;
+	let aborted = signal?.aborted ?? false;
+	const stdoutDecoder = new StringDecoder("utf8");
+	const stderrDecoder = new StringDecoder("utf8");
+	const cancelUiRequest = (request: JsonRecord) => {
+		const id = optionalString(request.id);
+		const method = optionalString(request.method);
+		if (aborted || !id || !["select", "confirm", "input", "editor"].includes(method ?? "") || !proc.stdin || proc.stdin.destroyed) return;
+		try {
+			proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id, cancelled: true })}\n`);
+		} catch (error) {
+			stdinError = error instanceof Error ? error : new Error(String(error));
+		}
+	};
+	const processLine = (line: string) => {
+		if (!line.trim()) return;
+		try {
+			const message: unknown = JSON.parse(line);
+			if (!isJsonRecord(message)) return;
+			if (message.type === "extension_ui_request") {
+				cancelUiRequest(message);
+				return;
+			}
+			if (message.type !== "response" || message.id !== requestId) return;
+			if (message.success !== true) {
+				rpcError = optionalString(message.error) ?? "Model discovery request failed";
+			} else {
+				const data = isJsonRecord(message.data) ? message.data : undefined;
+				if (Array.isArray(data?.models)) models = data.models;
+				else rpcError = "Model discovery response did not include models";
+			}
+			terminateProcess(proc);
+		} catch {
+			// RPC extensions may emit non-protocol output; only a correlated response matters.
+		}
+	};
+
 	const exitCode = await new Promise<number>((resolve) => {
 		let settled = false;
-		const onAbort = () => terminateProcess(proc);
+		const onAbort = () => {
+			aborted = true;
+			terminateProcess(proc);
+		};
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			terminateProcess(proc);
+		}, MODEL_DISCOVERY_TIMEOUT_MS);
+		timeout.unref();
 		const finish = (code: number) => {
 			if (settled) return;
 			settled = true;
+			clearTimeout(timeout);
 			signal?.removeEventListener("abort", onAbort);
 			resolve(code);
 		};
 
-		if (signal?.aborted) onAbort();
+		if (aborted) onAbort();
 		else signal?.addEventListener("abort", onAbort, { once: true });
 
 		proc.stdout.on("data", (data) => {
-			stdout += data.toString();
+			buffer += stdoutDecoder.write(data);
+			const lines = buffer.split("\n");
+			buffer = lines.pop() || "";
+			for (const line of lines) processLine(line);
 		});
 		proc.stderr.on("data", (data) => {
-			stderr += data.toString();
+			stderr += stderrDecoder.write(data);
 		});
-		proc.once("close", (code) => finish(code ?? 0));
+		proc.once("close", (code) => {
+			buffer += stdoutDecoder.end();
+			stderr += stderrDecoder.end();
+			if (buffer.trim()) processLine(buffer);
+			finish(code ?? 0);
+		});
 		proc.once("error", (error) => {
 			spawnError = error;
 			finish(1);
 		});
+		if (!proc.stdin) {
+			spawnError = new Error("Pi RPC stdin is unavailable");
+			terminateProcess(proc);
+			finish(1);
+			return;
+		}
+		proc.stdin.once("error", (error) => {
+			stdinError = error;
+			if (!models && !rpcError) {
+				terminateProcess(proc);
+				finish(1);
+			}
+		});
+		if (aborted) return;
+		try {
+			proc.stdin.write(`${JSON.stringify({ id: requestId, type: "get_available_models" })}\n`);
+		} catch (error) {
+			stdinError = error instanceof Error ? error : new Error(String(error));
+			terminateProcess(proc);
+			finish(1);
+		}
 	});
 
-	if (signal?.aborted) throw new Error("Model discovery aborted");
-	if (exitCode !== 0) throw spawnError ?? new Error(stderr.trim() || `Pi exited with code ${exitCode}`);
-	return stdout.trim() || "No models are currently available to the isolated subagent process.";
+	if (aborted || signal?.aborted) throw new Error("Model discovery aborted");
+	if (timedOut) throw new Error(`Model discovery timed out after ${MODEL_DISCOVERY_TIMEOUT_MS / 1000} seconds`);
+	if (exitCode !== 0) throw spawnError ?? stdinError ?? new Error(stderr.trim() || rpcError || `Pi exited with code ${exitCode}`);
+	if (rpcError) throw new Error(rpcError);
+	if (!models) throw new Error(stdinError?.message || stderr.trim() || "Pi did not return a model catalog");
+	return JSON.stringify({ schemaVersion: 1, source: "isolated-pi-rpc", models: normalizeDiscoveredModels(models) }, null, 2);
 }
 
 async function runSubagent(
@@ -342,10 +541,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_models",
 		label: "Subagent Models",
-		description: "List the models available to the isolated Pi child process, including its exact provider/model selectors and thinking support. Call this before choosing a subagent model in a fresh session or after model configuration changes. Do not invent model selectors.",
-		promptSnippet: "Discover the models available to isolated subagents",
+		description: "Discover the isolated Pi child process's live model catalog as structured JSON. Each model includes a selector, modality, exact thinking levels, token limits, configured cost metadata, and supported tool capabilities. Use it before selecting a subagent model in a fresh session or after model configuration changes. Compare objective requirements such as image input, context, output budget, and configured cost; do not infer unreported quality or latency.",
+		promptSnippet: "Discover the child model catalog and compare objective capabilities",
 		promptGuidelines: [
-			"Before the first model-selected subagent call in a session, use subagent_models to discover valid selectors. Choose an explicit model appropriate to the task; do not rely on the child default when cost or capability matters.",
+			"Before the first model-selected subagent call in a session, use subagent_models to obtain live selectors and capabilities. Pick explicitly based on task requirements: modality, context, output budget, supported thinking levels, and configured cost. Metadata does not establish relative quality, actual billing, or latency.",
 		],
 		parameters: Type.Object({}),
 
@@ -358,11 +557,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. A model can be selected per call, and optional startup skills can be preloaded. Use subagent_models to discover valid model selectors before selecting one in a fresh session.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
 		promptSnippet: "Delegate a task to an isolated subagent process",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
-			"Before selecting a subagent model in a fresh session, use subagent_models. Do not guess selectors or assume the parent model is available to the child.",
+			"Before selecting a subagent model in a fresh session, use subagent_models. Select from its live catalog based on the task's concrete needs; do not guess selectors or assume the parent model is available to the child.",
 		],
 		parameters: SubagentParams,
 

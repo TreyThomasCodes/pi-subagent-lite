@@ -23,8 +23,72 @@ const model = modelIndex === -1 ? undefined : args[modelIndex + 1];
 const thinkingIndex = args.indexOf("--thinking");
 const thinking = thinkingIndex === -1 ? undefined : args[thinkingIndex + 1];
 const emit = (message) => process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\n");
-if (args.includes("--list-models")) {
-  process.stdout.write("provider      model                thinking\nfixture       economical-model     yes\n");
+if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
+  const mode = process.env.PI_SUBAGENT_TEST_MODE;
+  let input = "";
+  const respondWithCatalog = (id) => {
+    const response = JSON.stringify({
+      id,
+      type: "response",
+      command: "get_available_models",
+      success: true,
+      data: {
+        models: [
+          {
+            provider: "fixture",
+            id: "economical-model",
+            name: "Économical fixture",
+            api: "fixture-api",
+            reasoning: true,
+            thinkingLevelMap: { off: null, low: null, xhigh: "xhigh", max: null },
+            input: ["text", "image"],
+            contextWindow: 200000,
+            maxTokens: 32000,
+            cost: {
+              input: 1,
+              output: 2,
+              cacheRead: 0.1,
+              cacheWrite: 0.2,
+              tiers: [{ inputTokensAbove: 100000, input: 2, output: 4, cacheRead: 0.2, cacheWrite: 0.4 }],
+            },
+            compat: { supportsAdditionalTools: true, supportsOpenAIGrammarTools: true, supportsToolSearch: true },
+          },
+          { provider: "fixture", id: "basic-model", reasoning: false, input: ["text"], contextWindow: 1000, maxTokens: 100 },
+          { provider: "missing-id" },
+        ],
+      },
+    }) + "\n";
+    process.stdout.write(JSON.stringify({ type: "extension_ui_request", id: "unrelated", method: "setStatus" }) + "\n");
+    if (mode === "fragmented") {
+      const encoded = Buffer.from(response);
+      const split = encoded.indexOf(Buffer.from("É")) + 1;
+      process.stdout.write(encoded.subarray(0, split));
+      setImmediate(() => process.stdout.write(encoded.subarray(split)));
+    } else {
+      process.stdout.write(response);
+    }
+  };
+  const processCommand = (line) => {
+    const command = JSON.parse(line);
+    if (command.type === "get_available_models") {
+      if (mode === "hang") return;
+      if (mode === "failure") {
+        process.stdout.write(JSON.stringify({ id: command.id, type: "response", command: command.type, success: false, error: "Fixture discovery failed" }) + "\n");
+      } else if (mode === "ui") {
+        process.stdout.write(JSON.stringify({ type: "extension_ui_request", id: "fixture-dialog", method: "confirm" }) + "\n");
+      } else {
+        respondWithCatalog(command.id);
+      }
+    } else if (command.type === "extension_ui_response" && command.id === "fixture-dialog" && command.cancelled === true) {
+      respondWithCatalog("subagent-models");
+    }
+  };
+  process.stdin.on("data", (chunk) => {
+    input += chunk;
+    const lines = input.split("\n");
+    input = lines.pop();
+    for (const line of lines) if (line) processCommand(line);
+  });
 } else if (model === "_fixture_invalid_model_") {
   process.stderr.write('Model "_fixture_invalid_model_" not found. Use --list-models to see available models.\n');
   process.exitCode = 1;
@@ -85,11 +149,76 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	const ctx = Object.freeze({ cwd: fixtureDir, hasUI: false, model: parentModel });
 	const task = "Find all test files";
 
-	await t.test("discovers models available to the isolated child process", async () => {
+	await t.test("discovers a structured model catalog from the isolated child process", async () => {
 		const result = await modelsTool.execute("models-test", {}, undefined, undefined, ctx);
-		assert.equal(result.content[0].text, "provider      model                thinking\nfixture       economical-model     yes");
-		assert.match(modelsTool.description, /fresh session/);
+		const catalog = JSON.parse(result.content[0].text) as {
+			schemaVersion: number;
+			source: string;
+			models: Array<{
+				selector: string;
+				name: string;
+				capabilities: { input: string[]; images: boolean; reasoning: boolean; thinkingLevels: string[]; toolSupport: Record<string, boolean> };
+				limits: { contextTokens?: number; maxOutputTokens?: number };
+				pricing?: { unit: string; input: number; tiers: Array<{ inputTokensAbove: number }> };
+			}>;
+		};
+		assert.equal(catalog.schemaVersion, 1);
+		assert.equal(catalog.source, "isolated-pi-rpc");
+		assert.deepEqual(catalog.models.map((model) => model.selector), ["fixture/basic-model", "fixture/economical-model"]);
+		const economical = catalog.models[1];
+		assert.equal(economical.name, "Économical fixture");
+		assert.deepEqual(economical.capabilities.input, ["text", "image"]);
+		assert.equal(economical.capabilities.images, true);
+		assert.deepEqual(economical.capabilities.thinkingLevels, ["minimal", "medium", "high", "xhigh"]);
+		assert.deepEqual(economical.capabilities.toolSupport, { additionalTools: true, grammarTools: true, toolSearch: true });
+		assert.deepEqual(economical.limits, { contextTokens: 200000, maxOutputTokens: 32000 });
+		assert.deepEqual(economical.pricing, {
+			unit: "USD per million tokens", input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2,
+			tiers: [{ inputTokensAbove: 100000, input: 2, output: 4, cacheRead: 0.2, cacheWrite: 0.4 }],
+		});
+		assert.deepEqual(catalog.models[0].capabilities.thinkingLevels, ["off"]);
+		assert.match(modelsTool.description, /structured JSON/);
 		assert.match(tool.description, /subagent_models/);
+	});
+
+	const withDiscoveryMode = async (mode: string, action: () => Promise<void>) => {
+		const originalMode = process.env.PI_SUBAGENT_TEST_MODE;
+		process.env.PI_SUBAGENT_TEST_MODE = mode;
+		try {
+			await action();
+		} finally {
+			if (originalMode === undefined) delete process.env.PI_SUBAGENT_TEST_MODE;
+			else process.env.PI_SUBAGENT_TEST_MODE = originalMode;
+		}
+	};
+
+	await t.test("cancels blocking extension UI requests during model discovery", async () => {
+		await withDiscoveryMode("ui", async () => {
+			const result = await modelsTool.execute("models-ui-test", {}, undefined, undefined, ctx);
+			assert.equal(JSON.parse(result.content[0].text).models.length, 2);
+		});
+	});
+
+	await t.test("preserves fragmented UTF-8 RPC output", async () => {
+		await withDiscoveryMode("fragmented", async () => {
+			const result = await modelsTool.execute("models-fragmented-test", {}, undefined, undefined, ctx);
+			const economical = JSON.parse(result.content[0].text).models.find((model: { selector: string }) => model.selector === "fixture/economical-model");
+			assert.equal(economical.name, "Économical fixture");
+		});
+	});
+
+	await t.test("propagates RPC model-discovery failures", async () => {
+		await withDiscoveryMode("failure", async () => {
+			await assert.rejects(modelsTool.execute("models-failure-test", {}, undefined, undefined, ctx), /Fixture discovery failed/);
+		});
+	});
+
+	await t.test("aborts a waiting RPC model discovery", async () => {
+		await withDiscoveryMode("hang", async () => {
+			const controller = new AbortController();
+			setTimeout(() => controller.abort(), 20).unref();
+			await assert.rejects(modelsTool.execute("models-abort-test", {}, controller.signal, undefined, ctx), /Model discovery aborted/);
+		});
 	});
 
 	const invoke = async (params: SubagentInput, updates?: AgentToolResult[]): Promise<Invocation> => {
