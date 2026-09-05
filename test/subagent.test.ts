@@ -21,7 +21,9 @@ const args = process.argv.slice(2);
 const modelIndex = args.indexOf("--model");
 const model = modelIndex === -1 ? undefined : args[modelIndex + 1];
 const emit = (message) => process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\n");
-if (model === "_fixture_invalid_model_") {
+if (args.includes("--list-models")) {
+  process.stdout.write("provider      model                thinking\nfixture       economical-model     yes\n");
+} else if (model === "_fixture_invalid_model_") {
   process.stderr.write('Model "_fixture_invalid_model_" not found. Use --list-models to see available models.\n');
   process.exitCode = 1;
 } else if (["_fixture_provider_error_", "_fixture_aborted_", "_fixture_empty_error_"].includes(model)) {
@@ -70,13 +72,22 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	// normal getPiInvocation path at the fixture and restore it in the hook above.
 	process.argv[1] = fixtureScript;
 	delete process.env.PI_SUBAGENT_LITE_DISABLE;
-	let registered: SubagentTool | undefined;
-	registerSubagent({ registerTool: (tool) => { registered = tool; } });
-	assert.ok(registered);
-	const tool = registered;
+	const registeredTools: SubagentTool[] = [];
+	registerSubagent({ registerTool: (tool) => { registeredTools.push(tool); } });
+	const tool = registeredTools.find((candidate) => candidate.name === "subagent");
+	const modelsTool = registeredTools.find((candidate) => candidate.name === "subagent_models");
+	assert.ok(tool);
+	assert.ok(modelsTool);
 	const parentModel = Object.freeze({ provider: "parent-provider", id: "parent-model" });
 	const ctx = Object.freeze({ cwd: fixtureDir, hasUI: false, model: parentModel });
 	const task = "Find all test files";
+
+	await t.test("discovers models available to the isolated child process", async () => {
+		const result = await modelsTool.execute("models-test", {}, undefined, undefined, ctx);
+		assert.equal(result.content[0].text, "provider      model                thinking\nfixture       economical-model     yes");
+		assert.match(modelsTool.description, /fresh session/);
+		assert.match(tool.description, /subagent_models/);
+	});
 
 	const invoke = async (params: SubagentInput, updates?: AgentToolResult[]): Promise<Invocation> => {
 		const result = await tool.execute("model-test", params, undefined, updates ? (r) => updates.push(r) : undefined, ctx);

@@ -24,6 +24,7 @@ Lightweight delegation without agent definition files or a separate configuratio
 
 - **Isolated context**: Each subagent runs in a separate `pi` process
 - **Live progress**: See turn-by-turn updates as the subagent works
+- **Model discovery**: Ask the extension which model selectors and thinking support are available to the isolated child
 - **Per-call model selection**: Choose a different model for each subagent with Pi's native `--model` selectors
 - **Optional skills**: Preload capabilities via `--skill` flags
 - **Auto-spill**: Long tasks (>4000 chars) are automatically written to a temp file to avoid CLI limits
@@ -62,10 +63,16 @@ npm test
 
 ## Usage
 
-Once installed, the `subagent` tool is available:
+Once installed, the `subagent_models` and `subagent` tools are available. In a fresh session, discover the child-compatible catalog before delegating with an explicit model:
 
 ```
-Run a subagent to find all test files in the project
+List the models available to isolated subagents
+```
+
+Then delegate using a selector the discovery tool returned:
+
+```
+Run a subagent using provider/model to find all test files in the project
 ```
 
 With skills:
@@ -78,10 +85,12 @@ You can also invoke multiple subagents in parallel by making separate tool calls
 
 ### Choosing a model
 
-Ask pi to use a specific model:
+First call `subagent_models`; it runs the same Pi executable and configuration as an isolated child and returns its current `pi --list-models` table. This avoids guessing which providers and model selectors are available, and shows whether each model supports thinking.
+
+Then choose one of the returned selectors:
 
 ```text
-Run a subagent using anthropic/claude-haiku-4-5 to find all test files in the project
+Run a subagent using provider/model to find all test files in the project
 ```
 
 Or specify it in a `subagent` tool call, with or without skills:
@@ -89,14 +98,14 @@ Or specify it in a `subagent` tool call, with or without skills:
 ```json
 {
   "task": "Review src/auth.ts for security issues and summarize your findings",
-  "model": "anthropic/claude-sonnet-4-5",
+  "model": "provider/model:high",
   "skills": ["code-review"]
 }
 ```
 
-- Prefer `provider/model` to avoid ambiguity between providers. Bare model IDs and Pi shorthand selectors (such as `haiku`) also work.
-- Pi's `:thinking` suffix is passed through, for example `anthropic/claude-sonnet-4-5:high`. Model IDs containing slashes or colons are left for Pi to resolve.
-- Run `pi --list-models` to see available models. Providers, authentication, and custom models must be configured for the child Pi process as usual; no separate subagent credentials are needed. Parent-only in-memory configuration is not copied into the child.
+- Prefer a full selector returned by `subagent_models`, usually `provider/model`, to avoid ambiguity. Pi shorthand selectors also work when they resolve uniquely.
+- Pi's `:thinking` suffix is passed through, for example `provider/model:high`. Model IDs containing slashes or colons are left for Pi to resolve.
+- Use `subagent_models` before the first model-selected delegation in a fresh session, and again after changing model configuration. It is the extension-supported way to run `pi --list-models` against the same environment as the isolated child. Providers, authentication, and custom models must be configured for the child Pi process as usual; no separate subagent credentials are needed. Parent-only in-memory configuration is not copied into the child.
 - **When omitted**, no `--model` flag is passed. The child uses Pi's normal configured default/fallback selection, preserving the original behavior. It does **not** automatically inherit the parent session's active model, and selecting a subagent model does not change the parent's model.
 - Leading/trailing whitespace is trimmed. Empty or whitespace-only selectors are rejected. Model resolution and provider errors from Pi are reported as tool failures.
 - The requested selector is shown in the tool header and initial progress update.
@@ -106,7 +115,7 @@ Or specify it in a `subagent` tool call, with or without skills:
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task` | `string` | Yes | The task to delegate to the subagent |
-| `model` | `string` | No | Pi model selector, preferably `provider/model`, passed via `--model`; defaults to the child Pi process's normal model selection |
+| `model` | `string` | No | A selector returned by `subagent_models`, preferably `provider/model`, passed via `--model`; defaults to the child Pi process's normal model selection |
 | `skills` | `string[]` | No | Optional skill paths or names to load via `--skill` |
 
 ## License

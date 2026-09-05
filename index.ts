@@ -130,6 +130,49 @@ function terminateProcess(proc: ChildProcess): void {
 	proc.kill("SIGTERM");
 }
 
+async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<string> {
+	const invocation = getPiInvocation(["--list-models"]);
+	const proc = spawn(invocation.command, invocation.args, {
+		cwd,
+		shell: false,
+		stdio: ["ignore", "pipe", "pipe"],
+		env: { ...process.env, PI_SUBAGENT_LITE_DISABLE: "true" },
+	});
+
+	let stdout = "";
+	let stderr = "";
+	let spawnError: Error | undefined;
+	const exitCode = await new Promise<number>((resolve) => {
+		let settled = false;
+		const onAbort = () => terminateProcess(proc);
+		const finish = (code: number) => {
+			if (settled) return;
+			settled = true;
+			signal?.removeEventListener("abort", onAbort);
+			resolve(code);
+		};
+
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+
+		proc.stdout.on("data", (data) => {
+			stdout += data.toString();
+		});
+		proc.stderr.on("data", (data) => {
+			stderr += data.toString();
+		});
+		proc.once("close", (code) => finish(code ?? 0));
+		proc.once("error", (error) => {
+			spawnError = error;
+			finish(1);
+		});
+	});
+
+	if (signal?.aborted) throw new Error("Model discovery aborted");
+	if (exitCode !== 0) throw spawnError ?? new Error(stderr.trim() || `Pi exited with code ${exitCode}`);
+	return stdout.trim() || "No models are currently available to the isolated subagent process.";
+}
+
 async function runSubagent(
 	cwd: string,
 	task: string,
@@ -266,7 +309,7 @@ const SubagentParams = Type.Object({
 	task: Type.String({ description: "Task to delegate to the subagent" }),
 	model: Type.Optional(
 		Type.String({
-			description: "Pi model selector passed to --model, preferably provider/model (e.g. anthropic/claude-haiku-4-5). Shorthand and :thinking suffixes are supported by Pi. Omit to use the child Pi process's configured default, not the parent session's active model.",
+			description: "Pi model selector returned by subagent_models, preferably provider/model. Shorthand and :thinking suffixes are supported by Pi. Omit to use the child Pi process's configured default, not the parent session's active model.",
 			minLength: 1,
 			pattern: "\\S",
 		}),
@@ -284,12 +327,29 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerTool({
+		name: "subagent_models",
+		label: "Subagent Models",
+		description: "List the models available to the isolated Pi child process, including its exact provider/model selectors and thinking support. Call this before choosing a subagent model in a fresh session or after model configuration changes. Do not invent model selectors.",
+		promptSnippet: "Discover the models available to isolated subagents",
+		promptGuidelines: [
+			"Before the first model-selected subagent call in a session, use subagent_models to discover valid selectors. Choose an explicit model appropriate to the task; do not rely on the child default when cost or capability matters.",
+		],
+		parameters: Type.Object({}),
+
+		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			const output = await listSubagentModels(ctx.cwd, signal);
+			return { content: [{ type: "text", text: output }] };
+		},
+	});
+
+	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. A model can be selected per call, and optional startup skills can be preloaded.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. A model can be selected per call, and optional startup skills can be preloaded. Use subagent_models to discover valid model selectors before selecting one in a fresh session.",
 		promptSnippet: "Delegate a task to an isolated subagent process",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
+			"Before selecting a subagent model in a fresh session, use subagent_models. Do not guess selectors or assume the parent model is available to the child.",
 		],
 		parameters: SubagentParams,
 
