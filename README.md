@@ -1,4 +1,4 @@
-# @jerryan/pi-subagent-lite
+# @treythomascodes/pi-subagent-lite
 
 A minimal pi extension that delegates tasks to isolated subagent processes.
 

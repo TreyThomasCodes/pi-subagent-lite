@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Renamed the independently maintained fork to `@treythomascodes/pi-subagent-lite`, preserving the original author and MIT license attribution.
 - Added an optional per-call `model` parameter using Pi's native `--model` selectors, with the requested model visible in the tool header and initial progress.
 - Preserved Pi's default model selection when `model` is omitted; blank selectors are rejected.
 - Fixed tool failure signaling and rendering so child-process/model errors are not reported as successful runs.
