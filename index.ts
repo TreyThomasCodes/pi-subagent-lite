@@ -5,13 +5,13 @@
  * Optionally loads startup skills via --skill flags.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Message } from "@mariozechner/pi-ai";
-import { type AgentToolResult, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import type { Message } from "@earendil-works/pi-ai";
+import { type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 const MAX_TASK_ARG_LENGTH = 4000;
@@ -25,17 +25,109 @@ Guidelines:
 - Be concise, but include enough detail for the parent agent to act on your findings.
 - End with a clear summary or conclusion.`;
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	if (currentScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
+type MessageContent = {
+	type?: string;
+	text?: unknown;
+	name?: unknown;
+};
+
+type AgentMessage = Message & { content: MessageContent[] };
+
+type PiRuntime = {
+	currentScript?: string;
+	execPath: string;
+	fileExists: (filePath: string) => boolean;
+};
+
+export function parseMessageEnd(line: string): AgentMessage | undefined {
+	if (!line.trim()) return undefined;
+
+	try {
+		const event: unknown = JSON.parse(line);
+		if (!event || typeof event !== "object") return undefined;
+
+		const candidate = event as { type?: unknown; message?: unknown };
+		if (candidate.type !== "message_end" || !candidate.message || typeof candidate.message !== "object") {
+			return undefined;
+		}
+
+		return candidate.message as AgentMessage;
+	} catch {
+		return undefined;
 	}
-	const execName = path.basename(process.execPath).toLowerCase();
+}
+
+export function getMessageText(message: Pick<AgentMessage, "content">): string {
+	if (!Array.isArray(message.content)) return "";
+
+	return message.content
+		.filter((part) => part?.type === "text" && typeof part.text === "string")
+		.map((part) => part.text as string)
+		.join("");
+}
+
+export function formatAssistantProgress(message: AgentMessage, turnCount: number): string {
+	const content = Array.isArray(message.content) ? message.content : [];
+	const toolCalls = content.filter((part) => part?.type === "toolCall");
+	let updateText: string;
+
+	if (toolCalls.length > 0) {
+		const counts = new Map<string, number>();
+		for (const call of toolCalls) {
+			const name = typeof call.name === "string" && call.name ? call.name : "unknown tool";
+			counts.set(name, (counts.get(name) || 0) + 1);
+		}
+		const tools = Array.from(counts.entries())
+			.map(([name, count]) => (count > 1 ? `${name} (x${count})` : name))
+			.join(", ");
+		updateText = `Turn ${turnCount}: ${tools}`;
+	} else {
+		updateText = `Turn ${turnCount}: thinking...`;
+	}
+
+	const text = getMessageText(message);
+	if (text) {
+		const preview = text.length > 60 ? text.slice(0, 60) + "..." : text;
+		updateText += `\n${preview}`;
+	}
+
+	return updateText;
+}
+
+export function getPiInvocation(
+	args: string[],
+	runtime: PiRuntime = {
+		currentScript: process.argv[1],
+		execPath: process.execPath,
+		fileExists: fs.existsSync,
+	},
+): { command: string; args: string[] } {
+	const currentScript = runtime.currentScript;
+	if (currentScript && runtime.fileExists(currentScript)) {
+		return { command: runtime.execPath, args: [currentScript, ...args] };
+	}
+	const execName = path.basename(runtime.execPath).toLowerCase();
 	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
 	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
+		return { command: runtime.execPath, args };
 	}
 	return { command: "pi", args };
+}
+
+function terminateProcess(proc: ChildProcess): void {
+	if (proc.exitCode !== null || proc.signalCode !== null) return;
+
+	const forceKillTimer = setTimeout(() => {
+		if (proc.exitCode === null && proc.signalCode === null) {
+			proc.kill("SIGKILL");
+		}
+	}, 5000);
+	forceKillTimer.unref();
+
+	const clearForceKillTimer = () => clearTimeout(forceKillTimer);
+	proc.once("close", clearForceKillTimer);
+	proc.once("error", clearForceKillTimer);
+	proc.kill("SIGTERM");
 }
 
 async function runSubagent(
@@ -79,44 +171,22 @@ async function runSubagent(
 
 		let buffer = "";
 		let stderr = "";
-		const messages: Message[] = [];
-
+		let spawnError: Error | undefined;
+		let lastAssistantText = "";
 		let turnCount = 0;
+
 		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			let event: any;
-			try {
-				event = JSON.parse(line);
-			} catch {
-				return;
-			}
-			if (event.type === "message_end" && event.message) {
-				const msg = event.message as Message & { content: any[] };
-				messages.push(msg);
-				if (msg.role === "assistant" && onUpdate) {
-					turnCount++;
-					const toolCalls = (msg.content ?? []).filter((c: any) => c.type === "toolCall");
-					const textParts = (msg.content ?? [])
-						.filter((c: any) => c.type === "text")
-						.map((c: any) => c.text)
-						.join("");
-					let updateText = "";
-					if (toolCalls.length > 0) {
-						const counts = new Map<string, number>();
-						for (const c of toolCalls) counts.set(c.name, (counts.get(c.name) || 0) + 1);
-						const toolsStr = Array.from(counts.entries())
-							.map(([name, count]) => (count > 1 ? `${name} (x${count})` : name))
-							.join(", ");
-						updateText = `Turn ${turnCount}: ${toolsStr}`;
-					} else {
-						updateText = `Turn ${turnCount}: thinking...`;
-					}
-					if (textParts) {
-						const preview = textParts.length > 60 ? textParts.slice(0, 60) + "..." : textParts;
-						updateText += `\n${preview}`;
-					}
-					onUpdate({ content: [{ type: "text", text: updateText }] });
-				}
+			const message = parseMessageEnd(line);
+			if (!message || message.role !== "assistant") return;
+
+			const text = getMessageText(message);
+			if (text) lastAssistantText = text;
+
+			if (onUpdate) {
+				turnCount++;
+				onUpdate({
+					content: [{ type: "text", text: formatAssistantProgress(message, turnCount) }],
+				});
 			}
 		};
 
@@ -132,11 +202,13 @@ async function runSubagent(
 		});
 
 		const exitCode = await new Promise<number>((resolve) => {
-			const onAbort = () => {
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 5000);
+			let settled = false;
+			const onAbort = () => terminateProcess(proc);
+			const finish = (code: number) => {
+				if (settled) return;
+				settled = true;
+				signal?.removeEventListener("abort", onAbort);
+				resolve(code);
 			};
 
 			if (signal?.aborted) {
@@ -145,33 +217,24 @@ async function runSubagent(
 				signal?.addEventListener("abort", onAbort, { once: true });
 			}
 
-			proc.on("close", (code) => {
-				signal?.removeEventListener("abort", onAbort);
+			proc.once("close", (code) => {
+				if (settled) return;
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				finish(code ?? 0);
 			});
-			proc.on("error", () => {
-				signal?.removeEventListener("abort", onAbort);
-				resolve(1);
+			proc.once("error", (error) => {
+				spawnError = error;
+				finish(1);
 			});
 		});
 
 		if (signal?.aborted) throw new Error("Subagent aborted");
 
 		if (exitCode !== 0) {
-			throw new Error(stderr || `Subagent exited with code ${exitCode}`);
+			throw spawnError ?? new Error(stderr.trim() || `Subagent exited with code ${exitCode}`);
 		}
 
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i];
-			if (msg.role === "assistant") {
-				for (const part of msg.content) {
-					if (part.type === "text") return part.text ?? "";
-				}
-			}
-		}
-
-		return "";
+		return lastAssistantText;
 	} finally {
 		if (tmpDir) {
 			try {

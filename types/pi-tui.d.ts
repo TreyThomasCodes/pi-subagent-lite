@@ -1,4 +1,4 @@
-declare module "@mariozechner/pi-tui" {
+declare module "@earendil-works/pi-tui" {
 	export interface Component {
 		render(width: number): string[];
 		invalidate(): void;

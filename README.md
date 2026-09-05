@@ -2,6 +2,14 @@
 
 A minimal pi extension that delegates tasks to isolated subagent processes.
 
+Requires Node.js 22.19 or newer, matching the current `@earendil-works/pi-*` packages.
+
+## Fork provenance
+
+This repository is a fork of [@jerryan/pi-subagent-lite](https://github.com/JerryAZR/pi-subagent-lite), originally authored by jerryan (GitHub: [JerryAZR](https://github.com/JerryAZR)). It is independently maintained by TreyThomasCodes and includes additional fixes and improvements.
+
+The original MIT license and copyright notices are preserved in [`LICENSE`](LICENSE).
+
 ## What makes this different?
 
 Most subagent extensions ship with heavy abstractions: agent definition files, configurable models, working-directory overrides, and a kitchen sink of rarely-used parameters. **This one doesn't.**
@@ -39,6 +47,14 @@ For local development, run inside the repo:
 
 ```bash
 pi -e .
+```
+
+To validate changes:
+
+```bash
+npm ci
+npm run check
+npm test
 ```
 
 ## Usage

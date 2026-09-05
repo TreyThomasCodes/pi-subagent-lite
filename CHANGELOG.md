@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Migrated Pi imports and peer dependencies to the `@earendil-works/pi-*` packages.
+- Raised the minimum Node.js version to 22.19 to match the current Pi packages.
+
 ## 0.1.3
 
 - Added missing `pi` manifest to `package.json` so pi can auto-discover the extension when installed as a package.
