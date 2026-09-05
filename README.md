@@ -15,7 +15,7 @@ The original MIT license and copyright notices are preserved in [`LICENSE`](LICE
 Lightweight delegation without agent definition files or a separate configuration system. Choose a model per task and reuse your existing pi skills when you need specialization.
 
 - **Zero setup**: Install via pi and use it in the next session. No agent directories to manage, no agent definitions to write.
-- **Minimal interface**: A required `task`, with optional `model` and `skills`. No agent definitions or working-directory overrides.
+- **Minimal interface**: A required `task`, with optional `model`, `thinking`, and `skills`. No agent definitions or working-directory overrides.
 - **No agent definitions**: Unlike almost every other subagent tool, we don't use `~/.pi/agent/agents/*.md` or any custom agent discovery. If you need specialization, **reuse your existing pi skills** via the `skills` parameter.
 - **One focused system prompt**: Every subagent gets the same lean, task-oriented prompt designed for delegation and clear reporting.
 - **Transparent long-task handling**: Tasks longer than 4000 chars are automatically spilled to a temp file so they never hit CLI length limits.
@@ -98,17 +98,18 @@ Or specify it in a `subagent` tool call, with or without skills:
 ```json
 {
   "task": "Review src/auth.ts for security issues and summarize your findings",
-  "model": "provider/model:high",
+  "model": "provider/model",
+  "thinking": "high",
   "skills": ["code-review"]
 }
 ```
 
 - Prefer a full selector returned by `subagent_models`, usually `provider/model`, to avoid ambiguity. Pi shorthand selectors also work when they resolve uniquely.
-- Pi's `:thinking` suffix is passed through, for example `provider/model:high`. Model IDs containing slashes or colons are left for Pi to resolve.
+- Set `thinking` to Pi's explicit level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`). It is passed as `--thinking` and shown separately in the subagent window. Pi's `:thinking` model-selector suffix is also passed through for backwards compatibility.
 - Use `subagent_models` before the first model-selected delegation in a fresh session, and again after changing model configuration. It is the extension-supported way to run `pi --list-models` against the same environment as the isolated child. Providers, authentication, and custom models must be configured for the child Pi process as usual; no separate subagent credentials are needed. Parent-only in-memory configuration is not copied into the child.
 - **When omitted**, no `--model` flag is passed. The child uses Pi's normal configured default/fallback selection, preserving the original behavior. It does **not** automatically inherit the parent session's active model, and selecting a subagent model does not change the parent's model.
 - Leading/trailing whitespace is trimmed. Empty or whitespace-only selectors are rejected. Model resolution and provider errors from Pi are reported as tool failures.
-- The requested selector is shown in the tool header and initial progress update.
+- The requested model and explicit thinking level are shown in the tool header and initial progress update.
 
 ## Tool Parameters
 
@@ -116,6 +117,7 @@ Or specify it in a `subagent` tool call, with or without skills:
 |-----------|------|----------|-------------|
 | `task` | `string` | Yes | The task to delegate to the subagent |
 | `model` | `string` | No | A selector returned by `subagent_models`, preferably `provider/model`, passed via `--model`; defaults to the child Pi process's normal model selection |
+| `thinking` | `"off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | No | Child thinking level, passed via `--thinking` and displayed beside the model |
 | `skills` | `string[]` | No | Optional skill paths or names to load via `--skill` |
 
 ## License

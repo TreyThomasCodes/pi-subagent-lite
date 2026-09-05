@@ -11,8 +11,8 @@ import { Value } from "@sinclair/typebox/value";
 import registerSubagent from "../index.js";
 
 type SubagentTool = Parameters<ExtensionAPI["registerTool"]>[0];
-type SubagentInput = { task: string; model?: string; skills?: string[] };
-type Invocation = { args: string[]; cwd: string; disabled: string; prompt: string; task: string };
+type SubagentInput = { task: string; model?: string; thinking?: string; skills?: string[] };
+type Invocation = { args: string[]; cwd: string; disabled: string; prompt: string; task: string; thinking?: string };
 
 // Exercise the real spawn/argument/parsing path without invoking Pi or a paid model.
 const FAKE_PI = String.raw`
@@ -20,6 +20,8 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 const modelIndex = args.indexOf("--model");
 const model = modelIndex === -1 ? undefined : args[modelIndex + 1];
+const thinkingIndex = args.indexOf("--thinking");
+const thinking = thinkingIndex === -1 ? undefined : args[thinkingIndex + 1];
 const emit = (message) => process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\n");
 if (args.includes("--list-models")) {
   process.stdout.write("provider      model                thinking\nfixture       economical-model     yes\n");
@@ -50,6 +52,7 @@ if (args.includes("--list-models")) {
     disabled: process.env.PI_SUBAGENT_LITE_DISABLE,
     prompt: fs.readFileSync(promptFile, "utf8"),
     task,
+    thinking,
   });
   emit({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" });
 }
@@ -101,6 +104,8 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		const schema = tool.parameters as TSchema;
 		assert.equal(Value.Check(schema, { task }), true);
 		assert.equal(Value.Check(schema, { task, model: "anthropic/claude-haiku-4-5" }), true);
+		assert.equal(Value.Check(schema, { task, thinking: "high" }), true);
+		assert.equal(Value.Check(schema, { task, thinking: "ultra" }), false);
 		for (const model of ["", " \t\n", 42, null, [], {}]) {
 			assert.equal(Value.Check(schema, { task, model }), false, `invalid model: ${JSON.stringify(model)}`);
 		}
@@ -125,7 +130,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 			assert.equal(invocation.cwd, fixtureDir);
 			assert.equal(invocation.disabled, "true");
 			assert.match(invocation.prompt, /You are a subagent/);
-			assert.equal(updates[0].content[0].text, `Subagent running (${model})...`);
+			assert.equal(updates[0].content[0].text, `Subagent running (model: ${model})...`);
 			assert.match(updates[1].content[0].text, /^Turn 1:/);
 		});
 	}
@@ -144,6 +149,31 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	await t.test("trims surrounding whitespace", async () => {
 		const invocation = await invoke({ task, model: " \tanthropic/claude-haiku-4-5\n" });
 		assert.equal(invocation.args[5], "anthropic/claude-haiku-4-5");
+	});
+
+	await t.test("passes and displays the requested thinking level", async () => {
+		const updates: AgentToolResult[] = [];
+		const invocation = await invoke({ task, model: "haiku", thinking: "high" }, updates);
+		assert.deepEqual(invocation.args.slice(4, 8), ["--model", "haiku", "--thinking", "high"]);
+		assert.equal(invocation.thinking, "high");
+		assert.equal(updates[0].content[0].text, "Subagent running (model: haiku, thinking: high)...");
+	});
+
+	await t.test("forwards thinking off", async () => {
+		const updates: AgentToolResult[] = [];
+		const invocation = await invoke({ task, model: "haiku", thinking: "off" }, updates);
+		assert.deepEqual(invocation.args.slice(4, 8), ["--model", "haiku", "--thinking", "off"]);
+		assert.equal(invocation.thinking, "off");
+		assert.equal(updates[0].content[0].text, "Subagent running (model: haiku, thinking: off)...");
+	});
+
+	await t.test("forwards thinking without a model and displays it in progress", async () => {
+		const updates: AgentToolResult[] = [];
+		const invocation = await invoke({ task, thinking: "high" }, updates);
+		assert.deepEqual(invocation.args.slice(4, 7), ["--thinking", "high", "--append-system-prompt"]);
+		assert.equal(invocation.args.includes("--model"), false);
+		assert.equal(invocation.thinking, "high");
+		assert.equal(updates[0].content[0].text, "Subagent running (thinking: high)...");
 	});
 
 	await t.test("preserves skills and long-task spillover alongside model selection", async () => {
@@ -207,9 +237,9 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	};
 
 	await t.test("renders the requested model and skill count in the header", () => {
-		const component = tool.renderCall!({ task, model: " haiku ", skills: ["review", "tests"] }, theme, renderContext);
+		const component = tool.renderCall!({ task, model: " haiku ", thinking: "high", skills: ["review", "tests"] }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[haiku\] \+2 skills/);
+		assert.match(text, /subagent Find all test files \[haiku\] \[thinking: high\] \+2 skills/);
 	});
 
 	await t.test("renders calls without a model and partial arguments", () => {
@@ -219,6 +249,13 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 			assert.match(text, /subagent/);
 			assert.doesNotMatch(text, /\[|undefined/);
 		}
+	});
+
+	await t.test("renders thinking without a model", () => {
+		const component = tool.renderCall!({ task, thinking: "off" }, theme, renderContext);
+		const text = stripVTControlCharacters(component.render(300).join("\n"));
+		assert.match(text, /subagent Find all test files \[thinking: off\]/);
+		assert.doesNotMatch(text, /undefined/);
 	});
 
 	await t.test("renders failed model selection as an error rather than a success", () => {
