@@ -1,4 +1,4 @@
-declare module "@mariozechner/pi-ai" {
+declare module "@earendil-works/pi-ai" {
 	export interface Message {
 		role: string;
 		content: any[];

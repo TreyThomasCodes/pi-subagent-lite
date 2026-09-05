@@ -2,6 +2,8 @@
 
 A minimal pi extension that delegates tasks to isolated subagent processes.
 
+Requires Node.js 22.19 or newer, matching the current `@earendil-works/pi-*` packages.
+
 ## What makes this different?
 
 Most subagent extensions ship with heavy abstractions: agent definition files, configurable models, working-directory overrides, and a kitchen sink of rarely-used parameters. **This one doesn't.**

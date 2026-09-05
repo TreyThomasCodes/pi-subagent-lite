@@ -1,4 +1,4 @@
-declare module "@mariozechner/pi-coding-agent" {
+declare module "@earendil-works/pi-coding-agent" {
 	export interface AgentToolResult<TDetails = unknown> {
 		content: Array<{ type: "text"; text: string }>;
 		isError?: boolean;
@@ -16,7 +16,7 @@ declare module "@mariozechner/pi-coding-agent" {
 		args: any;
 		toolCallId: string;
 		invalidate: () => void;
-		lastComponent: import("@mariozechner/pi-tui").Component | undefined;
+		lastComponent: import("@earendil-works/pi-tui").Component | undefined;
 		state: any;
 		cwd: string;
 		executionStarted: boolean;
@@ -47,8 +47,8 @@ declare module "@mariozechner/pi-coding-agent" {
 				onUpdate: AgentToolUpdateCallback | undefined,
 				ctx: ToolContext,
 			): Promise<AgentToolResult>;
-			renderCall?: (args: any, theme: any, context: ToolRenderContext) => import("@mariozechner/pi-tui").Component;
-			renderResult?: (result: AgentToolResult, options: ToolRenderResultOptions, theme: any, context: ToolRenderContext) => import("@mariozechner/pi-tui").Component;
+			renderCall?: (args: any, theme: any, context: ToolRenderContext) => import("@earendil-works/pi-tui").Component;
+			renderResult?: (result: AgentToolResult, options: ToolRenderResultOptions, theme: any, context: ToolRenderContext) => import("@earendil-works/pi-tui").Component;
 		}): void;
 	}
 }

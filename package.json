@@ -34,12 +34,12 @@
   },
   "homepage": "https://github.com/JerryAZR/pi-subagent-lite#readme",
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"
