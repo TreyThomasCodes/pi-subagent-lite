@@ -41,6 +41,14 @@ For local development, run inside the repo:
 pi -e .
 ```
 
+To validate changes:
+
+```bash
+npm ci
+npm run check
+npm test
+```
+
 ## Usage
 
 Once installed, the `subagent` tool is available:

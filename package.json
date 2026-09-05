@@ -4,6 +4,10 @@
   "description": "Minimal pi extension that delegates tasks to isolated subagent processes with optional skill loading",
   "main": "index.ts",
   "types": "index.ts",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test"
+  },
   "files": [
     "index.ts",
     "types",
@@ -37,9 +41,12 @@
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
   },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0"
+  },
   "devDependencies": {
-    "@sinclair/typebox": "^0.34.0",
     "@types/node": "^20.0.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.4.0"
   },
   "pi": {
