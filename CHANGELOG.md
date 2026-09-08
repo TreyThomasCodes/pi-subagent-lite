@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added optional bounded subagent runtimes with distinct timeout/cancellation errors and cross-platform process-tree termination.
 - Added explicit `read-only` and `workspace-write` subagent access modes. Read-only children receive only Pi's `read`, `grep`, `find`, and `ls` tools; omitted access preserves the existing workspace-write behavior.
 - Renamed the independently maintained fork to `@treythomascodes/pi-subagent-lite`, preserving the original author and MIT license attribution.
 - Added an optional per-call `model` parameter using Pi's native `--model` selectors, with the requested model visible in the tool header and initial progress.
