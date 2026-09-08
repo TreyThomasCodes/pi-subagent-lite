@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Defined a generic delegation packet and provisional-result contract in parent guidance, the child system prompt, examples, and tests.
 - Added per-process workspace-write leases that reject concurrent subagents targeting the same working directory while preserving parallel read-only and different-directory calls.
 - Added optional bounded subagent runtimes with distinct timeout/cancellation errors and cross-platform process-tree termination.
 - Added explicit `read-only` and `workspace-write` subagent access modes. Read-only children receive only Pi's `read`, `grep`, `find`, and `ls` tools; omitted access preserves the existing workspace-write behavior.
