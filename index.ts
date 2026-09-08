@@ -63,12 +63,14 @@ function getMinimalSystemPrompt(access: AccessMode): string {
 
 ${accessGuidance}
 
-Your job is to focus exclusively on the assigned task, use tools as needed, and provide a clear, concise report or summary at the end.
+Your job is to focus exclusively on the assigned task, use tools as needed, and provide a concise, evidence-based final report.
 
 Guidelines:
 - Stay focused on the task. Do not drift into unrelated work.
-- Be concise, but include enough detail for the parent agent to act on your findings.
-- End with a clear summary or conclusion.`;
+- Honor the task's stated objective, scope, access expectations, exclusions, verification, stopping conditions, and requested report format.
+- Report work completed or findings, files changed (if any), commands and checks actually run with their outcomes, unresolved blockers, and material uncertainty.
+- Distinguish observed results from assumptions, and never claim that an unrun check passed.
+- Do not claim parent-level acceptance or completion beyond the evidence; the parent agent will review your report and decide next steps.`;
 }
 
 type MessageContent = {
@@ -610,7 +612,7 @@ async function runSubagent(
 }
 
 const SubagentParams = Type.Object({
-	task: Type.String({ description: "Task to delegate to the subagent" }),
+	task: Type.String({ description: "Bounded delegation task. For non-trivial work, state the objective, scope, access expectations, exclusions, verification, stopping conditions, and requested report format." }),
 	model: Type.Optional(
 		Type.String({
 			description: "Pi model selector returned by subagent_models, preferably provider/model. Shorthand and :thinking suffixes are supported by Pi. Omit to use the child Pi process's configured default, not the parent session's active model.",
@@ -666,10 +668,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise summary or report when its work is done. Select read-only or workspace-write access and an optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
-		promptSnippet: "Delegate a task to an isolated subagent process",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise report when its work is done. A successful tool result is provisional: it is not proof that tests passed or that the parent should accept the work. Select read-only or workspace-write access and an optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
+		promptSnippet: "Delegate a bounded task and receive a provisional report",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
+			"For non-trivial delegation, state the objective, scope, access expectations, exclusions, verification, stopping conditions, and desired report format in the task.",
+			"Treat every successful subagent result as a provisional report, not proof that tests passed or that the task is accepted. Review the reported evidence, unresolved blockers, uncertainty, and workspace state before deciding next steps.",
 			"Parallelize read-only work freely, but run at most one workspace-write subagent per working directory at a time; a concurrent same-directory writer is rejected rather than queued.",
 			"Before selecting a subagent model in a fresh session, use subagent_models. Select from its live catalog based on the task's concrete needs; do not guess selectors or assume the parent model is available to the child.",
 		],

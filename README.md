@@ -78,25 +78,33 @@ Then delegate using a selector the discovery tool returned:
 Run a subagent using provider/model to find all test files in the project
 ```
 
-For a read-only review:
+For a bounded adversarial review:
 
 ```json
 {
-  "task": "Review src/auth.ts for security issues. Do not edit files.",
-  "access": "read-only"
+  "task": "Objective: adversarially review token refresh handling for races and stale-session use.\nScope: src/auth.ts, its direct callers, and focused tests.\nAccess expectations: inspect only; do not edit files.\nExclusions: unrelated authentication flows, dependencies, and configuration.\nVerification: trace each refresh path and compare behavior with existing tests.\nStopping conditions: stop after every in-scope path is assessed, or report a blocker if required context is unavailable.\nReport format: findings ordered by severity with file/line evidence, checks performed, blockers, and uncertainty.",
+  "access": "read-only",
+  "model": "provider/model",
+  "thinking": "high"
 }
 ```
 
-For an implementation task with skills:
+For a bounded implementation task with skills:
 
 ```json
 {
-  "task": "Implement the bounded auth fix in src/auth.ts and run its focused tests.",
+  "task": "Objective: fix the confirmed stale-session bug.\nScope: src/auth.ts and test/auth.test.ts.\nAccess expectations: modify only those files.\nExclusions: no dependency, configuration, or public API changes.\nVerification: run the focused auth test command and report its exact outcome.\nStopping conditions: stop and report a blocker if the fix requires broader schema or API changes.\nReport format: changed files, implementation summary, commands actually run with outcomes, blockers, and uncertainty.",
   "access": "workspace-write",
   "timeoutMs": 600000,
   "skills": ["code-review"]
 }
 ```
+
+### Writing a delegation packet
+
+The interface remains one `task` string rather than an agent-definition format. For non-trivial work, make that string a bounded packet that states the objective, scope, access expectations, exclusions, verification, stopping conditions, and desired report format. Include only fields relevant to the task, but make boundaries and expected evidence explicit.
+
+The child's final text is a provisional report. A successful `subagent` tool result means the child returned normally; it does not by itself prove that tests passed, that every claim is correct, or that the parent should accept the work. The child is asked to identify commands and checks actually run, their outcomes, unresolved blockers, and uncertainty. The parent remains responsible for reviewing the report and workspace state before deciding next steps.
 
 You can also invoke multiple read-only subagents in parallel by making separate tool calls in the same turn. Workspace-writing calls can run in parallel only when their working directories differ.
 
@@ -156,7 +164,7 @@ Or specify it in a `subagent` tool call, with or without skills:
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `task` | `string` | Yes | The task to delegate to the subagent |
+| `task` | `string` | Yes | Bounded delegation task; for non-trivial work, state objective, scope, access expectations, exclusions, verification, stopping conditions, and report format |
 | `access` | `"read-only" \| "workspace-write"` | No | Child tool access mode; defaults to `workspace-write`. `read-only` enables only `read`, `grep`, `find`, and `ls` |
 | `model` | `string` | No | A selector returned by `subagent_models`, preferably `provider/model`, passed via `--model`; defaults to the child Pi process's normal model selection |
 | `thinking` | `"off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | No | Child thinking level, passed via `--thinking` and displayed beside the model |

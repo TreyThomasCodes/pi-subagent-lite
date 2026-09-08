@@ -238,6 +238,14 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.match(tool.description, /subagent_models/);
 	});
 
+	await t.test("registered metadata defines bounded delegation and provisional results", () => {
+		const guidelines = tool.promptGuidelines?.join(" ") ?? "";
+		assert.match(tool.description, /successful tool result is provisional.*not proof that tests passed.*accept/i);
+		assert.match(tool.promptSnippet ?? "", /bounded task.*provisional report/i);
+		assert.match(guidelines, /objective.*scope.*access expectations.*exclusions.*verification.*stopping conditions.*report format/i);
+		assert.match(guidelines, /successful subagent result.*provisional report.*not proof.*tests passed.*accepted/i);
+	});
+
 	const withDiscoveryMode = async (mode: string, action: () => Promise<void>) => {
 		const originalMode = process.env.PI_SUBAGENT_TEST_MODE;
 		process.env.PI_SUBAGENT_TEST_MODE = mode;
@@ -288,6 +296,9 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 
 	await t.test("schema makes optional selections strict", () => {
 		const schema = tool.parameters as TSchema;
+		const taskDescription = (schema as unknown as { properties?: { task?: { description?: string } } })
+			.properties?.task?.description ?? "";
+		assert.match(taskDescription, /objective.*scope.*access expectations.*exclusions.*verification.*stopping conditions.*report format/i);
 		assert.equal(Value.Check(schema, { task }), true);
 		assert.equal(Value.Check(schema, { task, model: "anthropic/claude-haiku-4-5" }), true);
 		assert.equal(Value.Check(schema, { task, thinking: "high" }), true);
@@ -388,6 +399,10 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(invocation.args.includes("--tools"), false);
 		assert.equal(invocation.tools, undefined);
 		assert.match(invocation.prompt, /workspace-write access mode/);
+		assert.match(invocation.prompt, /objective, scope, access expectations, exclusions, verification, stopping conditions, and requested report format/);
+		assert.match(invocation.prompt, /commands and checks actually run with their outcomes, unresolved blockers, and material uncertainty/);
+		assert.match(invocation.prompt, /never claim that an unrun check passed/);
+		assert.match(invocation.prompt, /Do not claim parent-level acceptance or completion beyond the evidence/);
 		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write)...");
 	});
 
