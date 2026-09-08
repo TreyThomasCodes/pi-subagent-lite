@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -159,7 +159,8 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	});
 
 	const fixtureScript = join(fixtureDir, "fake-pi.cjs");
-	await writeFile(fixtureScript, FAKE_PI);
+	const otherCwd = join(fixtureDir, "other-workspace");
+	await Promise.all([writeFile(fixtureScript, FAKE_PI), mkdir(otherCwd)]);
 	// This file's tests run serially in their own test-runner process. Point the
 	// normal getPiInvocation path at the fixture and restore it in the hook above.
 	process.argv[1] = fixtureScript;
@@ -277,8 +278,8 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		});
 	});
 
-	const invoke = async (params: SubagentInput, updates?: AgentToolResult[]): Promise<Invocation> => {
-		const result = await tool.execute("model-test", params, undefined, updates ? (r) => updates.push(r) : undefined, ctx);
+	const invoke = async (params: SubagentInput, updates?: AgentToolResult[], invocationCtx = ctx): Promise<Invocation> => {
+		const result = await tool.execute("model-test", params, undefined, updates ? (r) => updates.push(r) : undefined, invocationCtx);
 		const invocation = JSON.parse(result.content[0].text) as Invocation;
 		const promptFile = invocation.args[invocation.args.indexOf("--append-system-prompt") + 1];
 		assert.equal(existsSync(dirname(promptFile)), false, "temporary prompts are cleaned up");
@@ -390,6 +391,14 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write)...");
 	});
 
+	await t.test("releases the workspace-write lease after normal completion", async () => {
+		const [first, second] = [
+			await invoke({ task, access: "workspace-write", model: "first-writer" }),
+			await invoke({ task, access: "workspace-write", model: "second-writer" }),
+		];
+		assert.deepEqual([first.cwd, second.cwd], [fixtureDir, fixtureDir]);
+	});
+
 	await t.test("normal completion accepts and reports a deadline without forwarding a Pi flag", async () => {
 		const updates: AgentToolResult[] = [];
 		const invocation = await invoke({ task, timeoutMs: 10_000 }, updates);
@@ -424,11 +433,22 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(updates.length, 0);
 	});
 
-	await t.test("propagates child model errors as failures without retrying with a default", async () => {
+	await t.test("propagates child model errors and releases the workspace-write lease", async () => {
 		await assert.rejects(
 			invoke({ task, model: "_fixture_invalid_model_" }),
 			/Model "_fixture_invalid_model_" not found\. Use --list-models/,
 		);
+		await invoke({ task, access: "workspace-write" });
+	});
+
+	await t.test("releases the workspace-write lease after a spawn error", async () => {
+		const missingCtx = { ...ctx, cwd: join(fixtureDir, "missing-workspace") };
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await assert.rejects(
+				tool.execute(`spawn-error-${attempt}`, { task }, undefined, undefined, missingCtx),
+				/ENOENT/,
+			);
+		}
 	});
 
 	for (const model of ["_fixture_provider_error_", "_fixture_aborted_", "_fixture_empty_error_"]) {
@@ -445,11 +465,46 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(invocation.task, task);
 	});
 
-	await t.test("parallel calls keep their model selections independent", async () => {
+	await t.test("parallel read-only calls remain supported and keep model selections independent", async () => {
 		const models = ["anthropic/claude-haiku-4-5", "openai/gpt-4.1"];
-		const results = await Promise.all(models.map((model) => invoke({ task, model })));
-		assert.deepEqual(results.map((r) => r.args[5]), models);
+		const results = await Promise.all(models.map((model) => invoke({ task, model, access: "read-only" })));
+		assert.deepEqual(results.map((result) => result.args[result.args.indexOf("--model") + 1]), models);
 		assert.equal(ctx.model, parentModel);
+	});
+
+	await t.test("rejects a second same-cwd writer while allowing readers and a different cwd", async () => {
+		await rm(pidFile, { force: true });
+		const controller = new AbortController();
+		const owner = assert.rejects(
+			tool.execute("lease-owner", { task, model: "_fixture_hanging_tree_" }, controller.signal, undefined, ctx),
+			/Subagent aborted by caller/,
+		);
+		let state: { pid: number; promptFile: string } | undefined;
+		try {
+			state = await readDescendantState();
+
+			const rejectedUpdates: AgentToolResult[] = [];
+			await assert.rejects(
+				tool.execute("lease-contender", { task }, undefined, (update) => rejectedUpdates.push(update), ctx),
+				/A workspace-write subagent is already running.*Wait for it to finish.*access: "read-only".*different working directory/,
+			);
+			assert.equal(rejectedUpdates.length, 0);
+
+			const [readerA, readerB, otherWriter] = await Promise.all([
+				invoke({ task, access: "read-only", model: "reader-a" }),
+				invoke({ task, access: "read-only", model: "reader-b" }),
+				invoke({ task, access: "workspace-write", model: "other-writer" }, undefined, { ...ctx, cwd: otherCwd }),
+			]);
+			assert.deepEqual([readerA.cwd, readerB.cwd, otherWriter.cwd], [fixtureDir, fixtureDir, otherCwd]);
+		} finally {
+			controller.abort();
+			await owner;
+			if (state) {
+				await waitForProcessExit(state.pid);
+				await assert.rejects(access(state.promptFile));
+			}
+		}
+		await invoke({ task, access: "workspace-write" });
 	});
 
 	await t.test("times out a hanging child and terminates its descendant process", async () => {
@@ -463,6 +518,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		await rejection;
 		await waitForProcessExit(pid);
 		await assert.rejects(access(promptFile));
+		await invoke({ task, access: "workspace-write" });
 	});
 
 	await t.test("caller abort terminates the child process tree with a distinct error", async () => {
@@ -478,6 +534,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		await rejection;
 		await waitForProcessExit(pid);
 		await assert.rejects(access(promptFile));
+		await invoke({ task, access: "workspace-write" });
 	});
 
 	await t.test("still forwards a pre-aborted signal with a model selected", async () => {
