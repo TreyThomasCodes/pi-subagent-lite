@@ -15,7 +15,7 @@ The original MIT license and copyright notices are preserved in [`LICENSE`](LICE
 Lightweight delegation without agent definition files or a separate configuration system. Choose a model per task and reuse your existing pi skills when you need specialization.
 
 - **Zero setup**: Install via pi and use it in the next session. No agent directories to manage, no agent definitions to write.
-- **Minimal interface**: A required `task`, with optional `access`, `model`, `thinking`, and `skills`. No agent definitions or working-directory overrides.
+- **Minimal interface**: A required `task`, with optional `access`, `model`, `thinking`, `timeoutMs`, and `skills`. No agent definitions or working-directory overrides.
 - **No agent definitions**: Unlike almost every other subagent tool, we don't use `~/.pi/agent/agents/*.md` or any custom agent discovery. If you need specialization, **reuse your existing pi skills** via the `skills` parameter.
 - **One focused system prompt**: Every subagent gets the same lean, task-oriented prompt designed for delegation and clear reporting.
 - **Transparent long-task handling**: Tasks longer than 4000 chars are automatically spilled to a temp file so they never hit CLI length limits.
@@ -27,6 +27,7 @@ Lightweight delegation without agent definition files or a separate configuratio
 - **Model discovery**: Get the isolated child's live model catalog, including selectors, capabilities, token limits, thinking levels, and configured cost metadata
 - **Per-call access modes**: Enforce a `read-only` Pi tool allowlist or preserve normal tools with `workspace-write`
 - **Per-call model selection**: Choose a different model for each subagent with Pi's native `--model` selectors
+- **Bounded runtime**: Optionally cap a child run and terminate its process tree on timeout or caller cancellation
 - **Optional skills**: Preload capabilities via `--skill` flags
 - **Auto-spill**: Long tasks (>4000 chars) are automatically written to a temp file to avoid CLI limits
 - **Clean result rendering**: Final output is clearly marked with a `✓ --- Result ---` separator
@@ -91,6 +92,7 @@ For an implementation task with skills:
 {
   "task": "Implement the bounded auth fix in src/auth.ts and run its focused tests.",
   "access": "workspace-write",
+  "timeoutMs": 600000,
   "skills": ["code-review"]
 }
 ```
@@ -105,6 +107,14 @@ You can also invoke multiple subagents in parallel by making separate tool calls
 - `workspace-write` passes no tool override and therefore preserves the child Pi process's normal configured tool set. This is the default when `access` is omitted, preserving compatibility with earlier versions.
 
 The selected mode is shown in the tool call and initial progress update. These modes control the child's callable Pi tools; they are **not an operating-system sandbox**. The child still inherits the parent process environment and working directory, and filesystem visibility is not isolated. `workspace-write` does not confine writes to that directory, while `read-only` cannot prevent loaded extension startup/lifecycle code, another process, or external tools from changing files. Review trusted skills, context files, and extensions accordingly.
+
+### Setting a deadline
+
+Set `timeoutMs` to an integer from `1000` (one second) through `86400000` (24 hours) to cap the child process runtime. The deadline appears in the tool call and initial progress update. When omitted, the extension imposes no deadline, preserving existing behavior.
+
+A deadline failure reports `Subagent timed out after ...` separately from caller cancellation (`Subagent aborted by caller`) and child model/provider failures. On timeout or cancellation, the extension terminates the Pi process tree using a detached process group on Unix-like platforms and Windows `taskkill /T` on Windows. Temporary prompt/task files and deadline listeners are still cleaned up.
+
+This is an overall child runtime cap, not a project-specific test-command policy. Put narrower command timeouts in the delegated task or project tooling when needed.
 
 ### Choosing a model
 
@@ -143,6 +153,7 @@ Or specify it in a `subagent` tool call, with or without skills:
 | `access` | `"read-only" \| "workspace-write"` | No | Child tool access mode; defaults to `workspace-write`. `read-only` enables only `read`, `grep`, `find`, and `ls` |
 | `model` | `string` | No | A selector returned by `subagent_models`, preferably `provider/model`, passed via `--model`; defaults to the child Pi process's normal model selection |
 | `thinking` | `"off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | No | Child thinking level, passed via `--thinking` and displayed beside the model |
+| `timeoutMs` | `integer` | No | Maximum child runtime in milliseconds, from `1000` through `86400000`; omitted means no extension-imposed deadline |
 | `skills` | `string[]` | No | Optional skill paths or names to load via `--skill` |
 
 ## License

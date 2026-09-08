@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import type { AgentToolResult, ExtensionAPI, ToolRenderContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
@@ -11,12 +12,13 @@ import { Value } from "@sinclair/typebox/value";
 import registerSubagent from "../index.js";
 
 type SubagentTool = Parameters<ExtensionAPI["registerTool"]>[0];
-type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; skills?: string[] };
+type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; skills?: string[] };
 type Invocation = { args: string[]; cwd: string; disabled: string; prompt: string; task: string; thinking?: string; tools?: string };
 
 // Exercise the real spawn/argument/parsing path without invoking Pi or a paid model.
 const FAKE_PI = String.raw`
 const fs = require("node:fs");
+const { spawn } = require("node:child_process");
 const args = process.argv.slice(2);
 const modelIndex = args.indexOf("--model");
 const model = modelIndex === -1 ? undefined : args[modelIndex + 1];
@@ -91,6 +93,14 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
     input = lines.pop();
     for (const line of lines) if (line) processCommand(line);
   });
+} else if (model === "_fixture_hanging_tree_") {
+  const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const promptIndex = args.indexOf("--append-system-prompt");
+  fs.writeFileSync(process.env.PI_SUBAGENT_TEST_PID_FILE, JSON.stringify({
+    pid: descendant.pid,
+    promptFile: promptIndex >= 0 ? args[promptIndex + 1] : undefined,
+  }));
+  setInterval(() => {}, 1000);
 } else if (model === "_fixture_invalid_model_") {
   process.stderr.write('Model "_fixture_invalid_model_" not found. Use --list-models to see available models.\n');
   process.exitCode = 1;
@@ -129,10 +139,22 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	const fixtureDir = await mkdtemp(join(tmpdir(), "subagent-model-test-"));
 	const originalScript = process.argv[1];
 	const originalDisabled = process.env.PI_SUBAGENT_LITE_DISABLE;
+	const originalPidFile = process.env.PI_SUBAGENT_TEST_PID_FILE;
+	const pidFile = join(fixtureDir, "descendant.pid");
+	const descendantPids = new Set<number>();
 	t.after(async () => {
 		process.argv[1] = originalScript;
 		if (originalDisabled === undefined) delete process.env.PI_SUBAGENT_LITE_DISABLE;
 		else process.env.PI_SUBAGENT_LITE_DISABLE = originalDisabled;
+		if (originalPidFile === undefined) delete process.env.PI_SUBAGENT_TEST_PID_FILE;
+		else process.env.PI_SUBAGENT_TEST_PID_FILE = originalPidFile;
+		for (const pid of descendantPids) {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				/* already stopped */
+			}
+		}
 		await rm(fixtureDir, { recursive: true, force: true });
 	});
 
@@ -142,6 +164,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	// normal getPiInvocation path at the fixture and restore it in the hook above.
 	process.argv[1] = fixtureScript;
 	delete process.env.PI_SUBAGENT_LITE_DISABLE;
+	process.env.PI_SUBAGENT_TEST_PID_FILE = pidFile;
 	const registeredTools: SubagentTool[] = [];
 	registerSubagent({ registerTool: (tool) => { registeredTools.push(tool); } });
 	const tool = registeredTools.find((candidate) => candidate.name === "subagent");
@@ -151,6 +174,36 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	const parentModel = Object.freeze({ provider: "parent-provider", id: "parent-model" });
 	const ctx = Object.freeze({ cwd: fixtureDir, hasUI: false, model: parentModel });
 	const task = "Find all test files";
+	const isProcessRunning = (pid: number) => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const readDescendantState = async (): Promise<{ pid: number; promptFile: string }> => {
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			try {
+				const state = JSON.parse(await readFile(pidFile, "utf8")) as { pid?: unknown; promptFile?: unknown };
+				if (Number.isInteger(state.pid) && (state.pid as number) > 0 && typeof state.promptFile === "string") {
+					descendantPids.add(state.pid as number);
+					return state as { pid: number; promptFile: string };
+				}
+			} catch {
+				/* wait for the fake child to spawn its descendant */
+			}
+			await delay(20);
+		}
+		throw new Error("Fake Pi did not report its descendant state");
+	};
+	const waitForProcessExit = async (pid: number) => {
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline && isProcessRunning(pid)) await delay(20);
+		assert.equal(isProcessRunning(pid), false, `descendant process ${pid} survived termination`);
+		descendantPids.delete(pid);
+	};
 
 	await t.test("discovers a structured model catalog from the isolated child process", async () => {
 		const result = await modelsTool.execute("models-test", {}, undefined, undefined, ctx);
@@ -241,6 +294,11 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(Value.Check(schema, { task, access: "read-only" }), true);
 		assert.equal(Value.Check(schema, { task, access: "workspace-write" }), true);
 		assert.equal(Value.Check(schema, { task, access: "write" }), false);
+		assert.equal(Value.Check(schema, { task, timeoutMs: 1_000 }), true);
+		assert.equal(Value.Check(schema, { task, timeoutMs: 86_400_000 }), true);
+		for (const timeoutMs of [999, 86_400_001, 1_000.5, "1000", null]) {
+			assert.equal(Value.Check(schema, { task, timeoutMs }), false, `invalid timeout: ${JSON.stringify(timeoutMs)}`);
+		}
 		for (const model of ["", " \t\n", 42, null, [], {}]) {
 			assert.equal(Value.Check(schema, { task, model }), false, `invalid model: ${JSON.stringify(model)}`);
 		}
@@ -332,6 +390,24 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write)...");
 	});
 
+	await t.test("normal completion accepts and reports a deadline without forwarding a Pi flag", async () => {
+		const updates: AgentToolResult[] = [];
+		const invocation = await invoke({ task, timeoutMs: 10_000 }, updates);
+		assert.equal(invocation.args.includes("--timeout"), false);
+		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write, timeout: 10000ms)...");
+	});
+
+	await t.test("rejects invalid deadlines before starting work", async () => {
+		const updates: AgentToolResult[] = [];
+		for (const timeoutMs of [999, 86_400_001, 1_000.5]) {
+			await assert.rejects(
+				tool.execute("invalid-timeout-test", { task, timeoutMs }, undefined, (update) => updates.push(update), ctx),
+				/timeoutMs must be an integer between 1000 and 86400000/,
+			);
+		}
+		assert.equal(updates.length, 0);
+	});
+
 	await t.test("preserves skills and long-task spillover alongside model selection", async () => {
 		const longTask = "x".repeat(4001);
 		const invocation = await invoke({ task: longTask, model: "haiku", skills: ["code-review", "skills/my skill.md"] });
@@ -358,7 +434,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	for (const model of ["_fixture_provider_error_", "_fixture_aborted_", "_fixture_empty_error_"]) {
 		await t.test(`reports JSON message failure for ${model} even when the child exits zero`, async () => {
 			await assert.rejects(
-				tool.execute("json-error-test", { task, model }, undefined, undefined, ctx),
+				tool.execute("json-error-test", { task, model, timeoutMs: 10_000 }, undefined, undefined, ctx),
 				model === "_fixture_empty_error_" ? /Subagent request error/ : /Provider rejected the request/,
 			);
 		});
@@ -376,7 +452,35 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(ctx.model, parentModel);
 	});
 
-	await t.test("still forwards the abort signal with a model selected", async () => {
+	await t.test("times out a hanging child and terminates its descendant process", async () => {
+		await rm(pidFile, { force: true });
+		const rejection = assert.rejects(
+			tool.execute("timeout-test", { task, model: "_fixture_hanging_tree_", timeoutMs: 1_000 }, undefined, undefined, ctx),
+			/Subagent timed out after 1000ms/,
+		);
+		const { pid, promptFile } = await readDescendantState();
+		assert.equal(isProcessRunning(pid), true);
+		await rejection;
+		await waitForProcessExit(pid);
+		await assert.rejects(access(promptFile));
+	});
+
+	await t.test("caller abort terminates the child process tree with a distinct error", async () => {
+		await rm(pidFile, { force: true });
+		const controller = new AbortController();
+		const rejection = assert.rejects(
+			tool.execute("abort-tree-test", { task, model: "_fixture_hanging_tree_" }, controller.signal, undefined, ctx),
+			/Subagent aborted by caller/,
+		);
+		const { pid, promptFile } = await readDescendantState();
+		assert.equal(isProcessRunning(pid), true);
+		controller.abort();
+		await rejection;
+		await waitForProcessExit(pid);
+		await assert.rejects(access(promptFile));
+	});
+
+	await t.test("still forwards a pre-aborted signal with a model selected", async () => {
 		const controller = new AbortController();
 		controller.abort();
 		await assert.rejects(
@@ -411,6 +515,12 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 			assert.match(text, /subagent/);
 			assert.doesNotMatch(text, /\[|undefined/);
 		}
+	});
+
+	await t.test("renders the requested deadline", () => {
+		const component = tool.renderCall!({ task, timeoutMs: 15_000 }, theme, renderContext);
+		const text = stripVTControlCharacters(component.render(300).join("\n"));
+		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[timeout: 15000ms\]/);
 	});
 
 	await t.test("renders thinking without a model", () => {

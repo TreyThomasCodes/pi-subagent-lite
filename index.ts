@@ -17,6 +17,8 @@ import { Type } from "@sinclair/typebox";
 
 const MAX_TASK_ARG_LENGTH = 4000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
+const MIN_SUBAGENT_TIMEOUT_MS = 1_000;
+const MAX_SUBAGENT_TIMEOUT_MS = 86_400_000;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 const ACCESS_MODES = ["read-only", "workspace-write"] as const;
@@ -130,20 +132,37 @@ export function getPiInvocation(
 	return { command: "pi", args };
 }
 
-function terminateProcess(proc: ChildProcess): void {
-	if (proc.exitCode !== null || proc.signalCode !== null) return;
+const terminatingProcesses = new WeakSet<ChildProcess>();
 
-	const forceKillTimer = setTimeout(() => {
-		if (proc.exitCode === null && proc.signalCode === null) {
+function terminateProcessTree(proc: ChildProcess): void {
+	if (terminatingProcesses.has(proc)) return;
+	terminatingProcesses.add(proc);
+
+	const pid = proc.pid;
+	if (pid === undefined) {
+		proc.kill("SIGKILL");
+		return;
+	}
+
+	if (process.platform === "win32") {
+		try {
+			const taskkill = spawn(
+				path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+				["/F", "/T", "/PID", String(pid)],
+				{ stdio: "ignore", detached: true, windowsHide: true },
+			);
+			taskkill.once("error", () => proc.kill("SIGKILL"));
+		} catch {
 			proc.kill("SIGKILL");
 		}
-	}, 5000);
-	forceKillTimer.unref();
+		return;
+	}
 
-	const clearForceKillTimer = () => clearTimeout(forceKillTimer);
-	proc.once("close", clearForceKillTimer);
-	proc.once("error", clearForceKillTimer);
-	proc.kill("SIGTERM");
+	try {
+		process.kill(-pid, "SIGKILL");
+	} catch {
+		proc.kill("SIGKILL");
+	}
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -268,6 +287,8 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<st
 		cwd,
 		shell: false,
 		stdio: ["pipe", "pipe", "pipe"],
+		detached: process.platform !== "win32",
+		windowsHide: true,
 		env: { ...process.env, PI_SUBAGENT_LITE_DISABLE: "true" },
 	});
 
@@ -308,7 +329,7 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<st
 				if (Array.isArray(data?.models)) models = data.models;
 				else rpcError = "Model discovery response did not include models";
 			}
-			terminateProcess(proc);
+			terminateProcessTree(proc);
 		} catch {
 			// RPC extensions may emit non-protocol output; only a correlated response matters.
 		}
@@ -318,11 +339,11 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<st
 		let settled = false;
 		const onAbort = () => {
 			aborted = true;
-			terminateProcess(proc);
+			terminateProcessTree(proc);
 		};
 		const timeout = setTimeout(() => {
 			timedOut = true;
-			terminateProcess(proc);
+			terminateProcessTree(proc);
 		}, MODEL_DISCOVERY_TIMEOUT_MS);
 		timeout.unref();
 		const finish = (code: number) => {
@@ -357,14 +378,14 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<st
 		});
 		if (!proc.stdin) {
 			spawnError = new Error("Pi RPC stdin is unavailable");
-			terminateProcess(proc);
+			terminateProcessTree(proc);
 			finish(1);
 			return;
 		}
 		proc.stdin.once("error", (error) => {
 			stdinError = error;
 			if (!models && !rpcError) {
-				terminateProcess(proc);
+				terminateProcessTree(proc);
 				finish(1);
 			}
 		});
@@ -373,14 +394,18 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<st
 			proc.stdin.write(`${JSON.stringify({ id: requestId, type: "get_available_models" })}\n`);
 		} catch (error) {
 			stdinError = error instanceof Error ? error : new Error(String(error));
-			terminateProcess(proc);
+			terminateProcessTree(proc);
 			finish(1);
 		}
 	});
 
 	if (aborted || signal?.aborted) throw new Error("Model discovery aborted");
 	if (timedOut) throw new Error(`Model discovery timed out after ${MODEL_DISCOVERY_TIMEOUT_MS / 1000} seconds`);
-	if (exitCode !== 0) throw spawnError ?? stdinError ?? new Error(stderr.trim() || rpcError || `Pi exited with code ${exitCode}`);
+	// A correlated RPC response intentionally terminates the persistent child,
+	// so process-tree termination may produce a non-zero platform exit code.
+	if (exitCode !== 0 && !models && !rpcError) {
+		throw spawnError ?? stdinError ?? new Error(stderr.trim() || `Pi exited with code ${exitCode}`);
+	}
 	if (rpcError) throw new Error(rpcError);
 	if (!models) throw new Error(stdinError?.message || stderr.trim() || "Pi did not return a model catalog");
 	return JSON.stringify({ schemaVersion: 1, source: "isolated-pi-rpc", models: normalizeDiscoveredModels(models) }, null, 2);
@@ -393,9 +418,15 @@ async function runSubagent(
 	access: AccessMode,
 	model?: string,
 	thinking?: ThinkingLevel,
+	timeoutMs?: number,
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult) => void,
 ): Promise<string> {
+	if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < MIN_SUBAGENT_TIMEOUT_MS || timeoutMs > MAX_SUBAGENT_TIMEOUT_MS)) {
+		throw new Error(`timeoutMs must be an integer between ${MIN_SUBAGENT_TIMEOUT_MS} and ${MAX_SUBAGENT_TIMEOUT_MS}`);
+	}
+	if (signal?.aborted) throw new Error("Subagent aborted by caller");
+
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (access === "read-only") args.push("--tools", READ_ONLY_TOOLS.join(","));
 	const modelSelector = model?.trim();
@@ -417,6 +448,7 @@ async function runSubagent(
 			`access: ${access}`,
 			modelSelector && `model: ${modelSelector}`,
 			thinking && `thinking: ${thinking}`,
+			timeoutMs !== undefined && `timeout: ${timeoutMs}ms`,
 		].filter(Boolean).join(", ");
 		onUpdate?.({
 			content: [{ type: "text", text: `Subagent running (${selection})...` }],
@@ -440,6 +472,8 @@ async function runSubagent(
 			cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
+			detached: process.platform !== "win32",
+			windowsHide: true,
 			env: { ...process.env, PI_SUBAGENT_LITE_DISABLE: "true" },
 		});
 
@@ -470,45 +504,62 @@ async function runSubagent(
 			}
 		};
 
-		proc.stdout.on("data", (data) => {
+		const onStdoutData = (data: Buffer) => {
 			buffer += data.toString();
 			const lines = buffer.split("\n");
 			buffer = lines.pop() || "";
 			for (const line of lines) processLine(line);
-		});
-
-		proc.stderr.on("data", (data) => {
+		};
+		const onStderrData = (data: Buffer) => {
 			stderr += data.toString();
-		});
+		};
+		proc.stdout.on("data", onStdoutData);
+		proc.stderr.on("data", onStderrData);
 
+		let terminationReason: "caller-abort" | "timeout" | undefined;
 		const exitCode = await new Promise<number>((resolve) => {
 			let settled = false;
-			const onAbort = () => terminateProcess(proc);
+			let timeoutHandle: NodeJS.Timeout | undefined;
+			const terminate = (reason: "caller-abort" | "timeout") => {
+				if (settled || terminationReason) return;
+				terminationReason = reason;
+				terminateProcessTree(proc);
+			};
+			const onAbort = () => terminate("caller-abort");
 			const finish = (code: number) => {
 				if (settled) return;
 				settled = true;
+				if (timeoutHandle) clearTimeout(timeoutHandle);
 				signal?.removeEventListener("abort", onAbort);
+				proc.removeListener("close", onClose);
+				proc.removeListener("error", onProcessError);
+				proc.stdout.removeListener("data", onStdoutData);
+				proc.stderr.removeListener("data", onStderrData);
 				resolve(code);
 			};
-
-			if (signal?.aborted) {
-				onAbort();
-			} else {
-				signal?.addEventListener("abort", onAbort, { once: true });
-			}
-
-			proc.once("close", (code) => {
+			const onClose = (code: number | null) => {
 				if (settled) return;
 				if (buffer.trim()) processLine(buffer);
 				finish(code ?? 0);
-			});
-			proc.once("error", (error) => {
+			};
+			const onProcessError = (error: Error) => {
 				spawnError = error;
 				finish(1);
-			});
+			};
+
+			if (timeoutMs !== undefined) {
+				timeoutHandle = setTimeout(() => terminate("timeout"), timeoutMs);
+				timeoutHandle.unref();
+			}
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+
+			proc.once("close", onClose);
+			proc.once("error", onProcessError);
 		});
 
-		if (signal?.aborted) throw new Error("Subagent aborted");
+		if (terminationReason === "caller-abort") throw new Error("Subagent aborted by caller");
+		if (terminationReason === "timeout") throw new Error(`Subagent timed out after ${timeoutMs}ms`);
 
 		if (exitCode !== 0) {
 			throw spawnError ?? new Error(stderr.trim() || lastAssistantError || `Subagent exited with code ${exitCode}`);
@@ -546,6 +597,13 @@ const SubagentParams = Type.Object({
 			description: "Child tool access mode. read-only enables only read, grep, find, and ls; workspace-write preserves Pi's normal tool configuration. Defaults to workspace-write for compatibility.",
 		}),
 	),
+	timeoutMs: Type.Optional(
+		Type.Integer({
+			description: "Maximum child runtime in milliseconds. Omit for no extension-imposed deadline.",
+			minimum: MIN_SUBAGENT_TIMEOUT_MS,
+			maximum: MAX_SUBAGENT_TIMEOUT_MS,
+		}),
+	),
 	skills: Type.Optional(
 		Type.Array(Type.String({ description: "Skill path or name to load via --skill" }), {
 			description: "Optional startup skills to load into the subagent process",
@@ -577,7 +635,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. Select read-only or workspace-write access per call; workspace-write is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. Select read-only or workspace-write access and an optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
 		promptSnippet: "Delegate a task to an isolated subagent process",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
@@ -594,6 +652,7 @@ export default function (pi: ExtensionAPI) {
 				params.access ?? DEFAULT_ACCESS_MODE,
 				params.model,
 				params.thinking,
+				params.timeoutMs,
 				signal,
 				onUpdate,
 			);
@@ -611,6 +670,7 @@ export default function (pi: ExtensionAPI) {
 			const model = args.model?.trim();
 			if (model) text += ` ${theme.fg("accent", `[${model}]`)}`;
 			if (args.thinking) text += ` ${theme.fg("accent", `[thinking: ${args.thinking}]`)}`;
+			if (args.timeoutMs !== undefined) text += ` ${theme.fg("accent", `[timeout: ${args.timeoutMs}ms]`)}`;
 			const skillsArr = args.skills ?? [];
 			if (skillsArr.length > 0) {
 				text += ` ${theme.fg("accent", `+${skillsArr.length} skills`)}`;
