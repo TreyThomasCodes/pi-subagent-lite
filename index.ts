@@ -2,7 +2,7 @@
  * Minimal subagent extension
  *
  * Delegates a task to a fresh pi process with an isolated context window.
- * Optionally selects a model via --model and loads startup skills via --skill flags.
+ * Optionally restricts child tools, selects a model via --model, and loads startup skills via --skill flags.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -19,8 +19,19 @@ const MAX_TASK_ARG_LENGTH = 4000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+const ACCESS_MODES = ["read-only", "workspace-write"] as const;
+type AccessMode = (typeof ACCESS_MODES)[number];
+const DEFAULT_ACCESS_MODE: AccessMode = "workspace-write";
+const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
 
-const MINIMAL_SYSTEM_PROMPT = `You are a subagent running in an isolated pi process with access to file system and shell tools.
+function getMinimalSystemPrompt(access: AccessMode): string {
+	const accessGuidance = access === "read-only"
+		? "You are in read-only access mode. Use only the available non-mutating tools and do not modify the workspace."
+		: "You are in workspace-write access mode. You may use the available tools to inspect and modify the workspace as the task requires.";
+
+	return `You are a subagent running in an isolated pi process.
+
+${accessGuidance}
 
 Your job is to focus exclusively on the assigned task, use tools as needed, and provide a clear, concise report or summary at the end.
 
@@ -28,6 +39,7 @@ Guidelines:
 - Stay focused on the task. Do not drift into unrelated work.
 - Be concise, but include enough detail for the parent agent to act on your findings.
 - End with a clear summary or conclusion.`;
+}
 
 type MessageContent = {
 	type?: string;
@@ -378,12 +390,14 @@ async function runSubagent(
 	cwd: string,
 	task: string,
 	skills: string[],
+	access: AccessMode,
 	model?: string,
 	thinking?: ThinkingLevel,
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult) => void,
 ): Promise<string> {
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	if (access === "read-only") args.push("--tools", READ_ONLY_TOOLS.join(","));
 	const modelSelector = model?.trim();
 	if (modelSelector !== undefined) {
 		if (!modelSelector) throw new Error("model must be a non-empty Pi model ID or provider/model selector");
@@ -400,16 +414,17 @@ async function runSubagent(
 
 	try {
 		const selection = [
+			`access: ${access}`,
 			modelSelector && `model: ${modelSelector}`,
 			thinking && `thinking: ${thinking}`,
 		].filter(Boolean).join(", ");
 		onUpdate?.({
-			content: [{ type: "text", text: selection ? `Subagent running (${selection})...` : "Subagent running..." }],
+			content: [{ type: "text", text: `Subagent running (${selection})...` }],
 		});
 
 		tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 		const promptFile = path.join(tmpDir, "prompt.md");
-		await fs.promises.writeFile(promptFile, MINIMAL_SYSTEM_PROMPT, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(promptFile, getMinimalSystemPrompt(access), { encoding: "utf-8", mode: 0o600 });
 		args.push("--append-system-prompt", promptFile);
 
 		if (task.length > MAX_TASK_ARG_LENGTH) {
@@ -526,6 +541,11 @@ const SubagentParams = Type.Object({
 			description: "Pi thinking level for the child model. Displayed with the selected model.",
 		}),
 	),
+	access: Type.Optional(
+		Type.Union(ACCESS_MODES.map((mode) => Type.Literal(mode)), {
+			description: "Child tool access mode. read-only enables only read, grep, find, and ls; workspace-write preserves Pi's normal tool configuration. Defaults to workspace-write for compatibility.",
+		}),
+	),
 	skills: Type.Optional(
 		Type.Array(Type.String({ description: "Skill path or name to load via --skill" }), {
 			description: "Optional startup skills to load into the subagent process",
@@ -557,7 +577,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. Select read-only or workspace-write access per call; workspace-write is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
 		promptSnippet: "Delegate a task to an isolated subagent process",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
@@ -567,16 +587,27 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			// Pi marks thrown errors as failed tool results; returning isError does not.
-			const output = await runSubagent(ctx.cwd, params.task, params.skills ?? [], params.model, params.thinking, signal, onUpdate);
+			const output = await runSubagent(
+				ctx.cwd,
+				params.task,
+				params.skills ?? [],
+				params.access ?? DEFAULT_ACCESS_MODE,
+				params.model,
+				params.thinking,
+				signal,
+				onUpdate,
+			);
 			return {
 				content: [{ type: "text", text: output || "(no output)" }],
 			};
 		},
 
-		renderCall(args, theme) {
+		renderCall(args, theme, context) {
 			const task = args.task ?? "";
 			const taskPreview = task.length > 60 ? task.slice(0, 60) + "..." : task;
 			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("dim", taskPreview);
+			const access = args.access ?? (context.argsComplete ? DEFAULT_ACCESS_MODE : undefined);
+			if (access) text += ` ${theme.fg("accent", `[access: ${access}]`)}`;
 			const model = args.model?.trim();
 			if (model) text += ` ${theme.fg("accent", `[${model}]`)}`;
 			if (args.thinking) text += ` ${theme.fg("accent", `[thinking: ${args.thinking}]`)}`;
