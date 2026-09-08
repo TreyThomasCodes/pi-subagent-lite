@@ -28,6 +28,7 @@ Lightweight delegation without agent definition files or a separate configuratio
 - **Per-call access modes**: Enforce a `read-only` Pi tool allowlist or preserve normal tools with `workspace-write`
 - **Per-call model selection**: Choose a different model for each subagent with Pi's native `--model` selectors
 - **Bounded runtime**: Optionally cap a child run and terminate its process tree on timeout or caller cancellation
+- **Workspace-write coordination**: Reject concurrent writers targeting the same working directory while preserving parallel read-only work
 - **Optional skills**: Preload capabilities via `--skill` flags
 - **Auto-spill**: Long tasks (>4000 chars) are automatically written to a temp file to avoid CLI limits
 - **Clean result rendering**: Final output is clearly marked with a `✓ --- Result ---` separator
@@ -97,7 +98,7 @@ For an implementation task with skills:
 }
 ```
 
-You can also invoke multiple subagents in parallel by making separate tool calls in the same turn, each with its own access mode and model.
+You can also invoke multiple read-only subagents in parallel by making separate tool calls in the same turn. Workspace-writing calls can run in parallel only when their working directories differ.
 
 ### Choosing an access mode
 
@@ -107,6 +108,12 @@ You can also invoke multiple subagents in parallel by making separate tool calls
 - `workspace-write` passes no tool override and therefore preserves the child Pi process's normal configured tool set. This is the default when `access` is omitted, preserving compatibility with earlier versions.
 
 The selected mode is shown in the tool call and initial progress update. These modes control the child's callable Pi tools; they are **not an operating-system sandbox**. The child still inherits the parent process environment and working directory, and filesystem visibility is not isolated. `workspace-write` does not confine writes to that directory, while `read-only` cannot prevent loaded extension startup/lifecycle code, another process, or external tools from changing files. Review trusted skills, context files, and extensions accordingly.
+
+### Coordinating workspace writes
+
+Within one extension process, only one `workspace-write` subagent may run against a resolved working directory at a time. A second same-directory writer is rejected immediately with guidance to wait, use `read-only`, or choose a different working directory; calls are not silently queued. The lease is released after success, child failure, timeout, caller cancellation, or spawn failure. Read-only calls do not take a mutation lease, and writers using different working directories do not contend.
+
+This is a local coordination guard, not a filesystem lock or sandbox. It cannot stop the parent agent, another Pi/extension process, or an external tool from writing concurrently. Different working directories may still target the same files because `workspace-write` does not confine filesystem access. The extension does not create Git worktrees or impose repository-specific execution phases.
 
 ### Setting a deadline
 

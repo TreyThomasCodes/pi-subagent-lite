@@ -25,6 +25,34 @@ const ACCESS_MODES = ["read-only", "workspace-write"] as const;
 type AccessMode = (typeof ACCESS_MODES)[number];
 const DEFAULT_ACCESS_MODE: AccessMode = "workspace-write";
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
+const activeWorkspaceWriteLeases = new Set<string>();
+
+function getWorkspaceLeaseKey(cwd: string): string {
+	let resolved: string;
+	try {
+		resolved = fs.realpathSync.native(cwd);
+	} catch {
+		resolved = path.resolve(cwd);
+	}
+	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function acquireWorkspaceWriteLease(cwd: string): () => void {
+	const key = getWorkspaceLeaseKey(cwd);
+	if (activeWorkspaceWriteLeases.has(key)) {
+		throw new Error(
+			`A workspace-write subagent is already running in ${cwd}. Wait for it to finish, use access: "read-only" for parallel inspection, or run against a different working directory.`,
+		);
+	}
+	activeWorkspaceWriteLeases.add(key);
+
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		activeWorkspaceWriteLeases.delete(key);
+	};
+}
 
 function getMinimalSystemPrompt(access: AccessMode): string {
 	const accessGuidance = access === "read-only"
@@ -441,6 +469,9 @@ async function runSubagent(
 		args.push("--skill", skill);
 	}
 
+	const releaseWorkspaceWriteLease = access === "workspace-write"
+		? acquireWorkspaceWriteLease(cwd)
+		: undefined;
 	let tmpDir: string | null = null;
 
 	try {
@@ -568,12 +599,12 @@ async function runSubagent(
 
 		return lastAssistantText;
 	} finally {
-		if (tmpDir) {
-			try {
-				await fs.promises.rm(tmpDir, { recursive: true, force: true });
-			} catch {
-				/* ignore */
-			}
+		try {
+			if (tmpDir) await fs.promises.rm(tmpDir, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		} finally {
+			releaseWorkspaceWriteLease?.();
 		}
 	}
 }
@@ -635,10 +666,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. You may invoke multiple subagents in parallel via separate tool calls. Each subagent returns a concise summary or report when its work is done. Select read-only or workspace-write access and an optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise summary or report when its work is done. Select read-only or workspace-write access and an optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
 		promptSnippet: "Delegate a task to an isolated subagent process",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
+			"Parallelize read-only work freely, but run at most one workspace-write subagent per working directory at a time; a concurrent same-directory writer is rejected rather than queued.",
 			"Before selecting a subagent model in a fresh session, use subagent_models. Select from its live catalog based on the task's concrete needs; do not guess selectors or assume the parent model is available to the child.",
 		],
 		parameters: SubagentParams,
