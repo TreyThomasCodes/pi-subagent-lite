@@ -11,8 +11,8 @@ import { Value } from "@sinclair/typebox/value";
 import registerSubagent from "../index.js";
 
 type SubagentTool = Parameters<ExtensionAPI["registerTool"]>[0];
-type SubagentInput = { task: string; model?: string; thinking?: string; skills?: string[] };
-type Invocation = { args: string[]; cwd: string; disabled: string; prompt: string; task: string; thinking?: string };
+type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; skills?: string[] };
+type Invocation = { args: string[]; cwd: string; disabled: string; prompt: string; task: string; thinking?: string; tools?: string };
 
 // Exercise the real spawn/argument/parsing path without invoking Pi or a paid model.
 const FAKE_PI = String.raw`
@@ -22,6 +22,8 @@ const modelIndex = args.indexOf("--model");
 const model = modelIndex === -1 ? undefined : args[modelIndex + 1];
 const thinkingIndex = args.indexOf("--thinking");
 const thinking = thinkingIndex === -1 ? undefined : args[thinkingIndex + 1];
+const toolsIndex = args.indexOf("--tools");
+const tools = toolsIndex === -1 ? undefined : args[toolsIndex + 1];
 const emit = (message) => process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\n");
 if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
   const mode = process.env.PI_SUBAGENT_TEST_MODE;
@@ -117,6 +119,7 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
     prompt: fs.readFileSync(promptFile, "utf8"),
     task,
     thinking,
+    tools,
   });
   emit({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" });
 }
@@ -229,12 +232,15 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		return invocation;
 	};
 
-	await t.test("schema makes model optional and rejects blank or non-string selectors", () => {
+	await t.test("schema makes optional selections strict", () => {
 		const schema = tool.parameters as TSchema;
 		assert.equal(Value.Check(schema, { task }), true);
 		assert.equal(Value.Check(schema, { task, model: "anthropic/claude-haiku-4-5" }), true);
 		assert.equal(Value.Check(schema, { task, thinking: "high" }), true);
 		assert.equal(Value.Check(schema, { task, thinking: "ultra" }), false);
+		assert.equal(Value.Check(schema, { task, access: "read-only" }), true);
+		assert.equal(Value.Check(schema, { task, access: "workspace-write" }), true);
+		assert.equal(Value.Check(schema, { task, access: "write" }), false);
 		for (const model of ["", " \t\n", 42, null, [], {}]) {
 			assert.equal(Value.Check(schema, { task, model }), false, `invalid model: ${JSON.stringify(model)}`);
 		}
@@ -259,7 +265,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 			assert.equal(invocation.cwd, fixtureDir);
 			assert.equal(invocation.disabled, "true");
 			assert.match(invocation.prompt, /You are a subagent/);
-			assert.equal(updates[0].content[0].text, `Subagent running (model: ${model})...`);
+			assert.equal(updates[0].content[0].text, `Subagent running (access: workspace-write, model: ${model})...`);
 			assert.match(updates[1].content[0].text, /^Turn 1:/);
 		});
 	}
@@ -271,7 +277,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(invocation.args.includes("--model"), false);
 		assert.equal(invocation.args.includes("--provider"), false);
 		assert.equal(invocation.args.includes("--thinking"), false);
-		assert.equal(updates[0].content[0].text, "Subagent running...");
+		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write)...");
 		assert.equal(ctx.model, parentModel);
 	});
 
@@ -285,7 +291,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		const invocation = await invoke({ task, model: "haiku", thinking: "high" }, updates);
 		assert.deepEqual(invocation.args.slice(4, 8), ["--model", "haiku", "--thinking", "high"]);
 		assert.equal(invocation.thinking, "high");
-		assert.equal(updates[0].content[0].text, "Subagent running (model: haiku, thinking: high)...");
+		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write, model: haiku, thinking: high)...");
 	});
 
 	await t.test("forwards thinking off", async () => {
@@ -293,7 +299,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		const invocation = await invoke({ task, model: "haiku", thinking: "off" }, updates);
 		assert.deepEqual(invocation.args.slice(4, 8), ["--model", "haiku", "--thinking", "off"]);
 		assert.equal(invocation.thinking, "off");
-		assert.equal(updates[0].content[0].text, "Subagent running (model: haiku, thinking: off)...");
+		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write, model: haiku, thinking: off)...");
 	});
 
 	await t.test("forwards thinking without a model and displays it in progress", async () => {
@@ -302,7 +308,28 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.deepEqual(invocation.args.slice(4, 7), ["--thinking", "high", "--append-system-prompt"]);
 		assert.equal(invocation.args.includes("--model"), false);
 		assert.equal(invocation.thinking, "high");
-		assert.equal(updates[0].content[0].text, "Subagent running (thinking: high)...");
+		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write, thinking: high)...");
+	});
+
+	await t.test("enforces read-only mode with an explicit non-mutating tool allowlist", async () => {
+		const updates: AgentToolResult[] = [];
+		const invocation = await invoke({ task, access: "read-only" }, updates);
+		assert.deepEqual(invocation.args.slice(0, 7), [
+			"--mode", "json", "-p", "--no-session", "--tools", "read,grep,find,ls", "--append-system-prompt",
+		]);
+		assert.equal(invocation.tools, "read,grep,find,ls");
+		assert.match(invocation.prompt, /read-only access mode/);
+		assert.match(invocation.prompt, /do not modify the workspace/);
+		assert.equal(updates[0].content[0].text, "Subagent running (access: read-only)...");
+	});
+
+	await t.test("explicit workspace-write mode preserves Pi's normal tool configuration", async () => {
+		const updates: AgentToolResult[] = [];
+		const invocation = await invoke({ task, access: "workspace-write" }, updates);
+		assert.equal(invocation.args.includes("--tools"), false);
+		assert.equal(invocation.tools, undefined);
+		assert.match(invocation.prompt, /workspace-write access mode/);
+		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write)...");
 	});
 
 	await t.test("preserves skills and long-task spillover alongside model selection", async () => {
@@ -368,7 +395,13 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	await t.test("renders the requested model and skill count in the header", () => {
 		const component = tool.renderCall!({ task, model: " haiku ", thinking: "high", skills: ["review", "tests"] }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[haiku\] \[thinking: high\] \+2 skills/);
+		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[haiku\] \[thinking: high\] \+2 skills/);
+	});
+
+	await t.test("renders explicit read-only access in the header", () => {
+		const component = tool.renderCall!({ task, access: "read-only" }, theme, renderContext);
+		const text = stripVTControlCharacters(component.render(300).join("\n"));
+		assert.match(text, /subagent Find all test files \[access: read-only\]/);
 	});
 
 	await t.test("renders calls without a model and partial arguments", () => {
@@ -383,7 +416,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	await t.test("renders thinking without a model", () => {
 		const component = tool.renderCall!({ task, thinking: "off" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[thinking: off\]/);
+		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[thinking: off\]/);
 		assert.doesNotMatch(text, /undefined/);
 	});
 
