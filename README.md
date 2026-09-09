@@ -27,7 +27,7 @@ Lightweight delegation without agent definition files or a separate configuratio
 - **Model discovery**: Get the isolated child's live model catalog, including selectors, capabilities, token limits, thinking levels, and configured cost metadata
 - **Per-call access modes**: Enforce a `read-only` Pi tool allowlist or preserve normal tools with `workspace-write`
 - **Preflighted model selection**: Choose a different model for each subagent with Pi's native `--model` selectors, validated before the task child starts
-- **Bounded runtime**: Optionally cap a child run and terminate its process tree on timeout or caller cancellation
+- **Bounded runtime**: Optionally cap a child run, terminate its process tree, and return bounded recovery evidence on timeout or caller cancellation
 - **Workspace-write coordination**: Reject concurrent writers targeting the same working directory while preserving parallel read-only work
 - **Optional skills**: Preload capabilities via `--skill` flags
 - **Auto-spill**: Long tasks (>4000 chars) are automatically written to a temp file to avoid CLI limits
@@ -127,9 +127,11 @@ This is a local coordination guard, not a filesystem lock or sandbox. It cannot 
 
 Set `timeoutMs` to an integer from `1000` (one second) through `86400000` (24 hours) to cap the child process runtime. The deadline appears in the tool call and initial progress update. When omitted, the extension imposes no deadline, preserving existing behavior.
 
-A deadline failure reports `Subagent timed out after ...` separately from caller cancellation (`Subagent aborted by caller`) and child model/provider failures. On timeout or cancellation, the extension terminates the Pi process tree using a detached process group on Unix-like platforms and Windows `taskkill /T` on Windows. Temporary prompt/task files and deadline listeners are still cleaned up.
+A deadline failure reports `Subagent timed out after ...` separately from caller cancellation (`Subagent aborted by caller`) and child model/provider failures. Timeout, cancellation, and abnormal child failures include a bounded recovery block: elapsed time, requested model, access mode, and deadline; whether a final child response and any assistant `message_end` were observed; a tail of progress summaries without assistant text; and process-tree termination evidence. The child runs with `--no-session`, so no session/log locator is available.
 
-This is an overall child runtime cap, not a project-specific test-command policy. Put narrower command timeouts in the delegated task or project tooling when needed.
+On timeout or cancellation, the extension terminates the Pi process tree using a detached process group on Unix-like platforms and Windows `taskkill /T` on Windows. It records the termination request or helper outcome, waits for the root process to close for a bounded grace period, and warns if the root may still be running. The child does not expose a descendant-PID inventory, so recovery diagnostics explicitly report descendant verification as unavailable; a submitted tree kill is evidence of an attempt, not an operating-system sandbox or proof that every descendant is gone. Temporary prompt/task files and deadline listeners are still cleaned up.
+
+This is an overall child runtime cap, not a project-specific test-command policy. After a timeout or cancellation, inspect the recovery block, verify workspace changes and any suspected survivors, and run project checks before starting another writer. Put narrower command timeouts in the delegated task or project tooling when needed.
 
 ### Choosing a model
 

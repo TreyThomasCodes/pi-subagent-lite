@@ -104,13 +104,23 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
 } else {
   if (taskSpawnFile) fs.appendFileSync(taskSpawnFile, (model || "(default)") + "\n");
   if (model === "_fixture_hanging_tree_") {
+    emit({ role: "assistant", content: [{ type: "text", text: "Starting bounded work" }], stopReason: "toolUse" });
     const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     const promptIndex = args.indexOf("--append-system-prompt");
     fs.writeFileSync(process.env.PI_SUBAGENT_TEST_PID_FILE, JSON.stringify({
       pid: descendant.pid,
+      rootPid: process.pid,
       promptFile: promptIndex >= 0 ? args[promptIndex + 1] : undefined,
     }));
     setInterval(() => {}, 1000);
+  } else if (model === "_fixture_error_then_hang_") {
+    emit({ role: "assistant", content: [{ type: "text", text: "Earlier terminal error must not be treated as final" }], stopReason: "error", errorMessage: "Transient provider failure" });
+    emit({ role: "assistant", content: [{ type: "text", text: "Retry is still running" }], stopReason: "toolUse" });
+    setInterval(() => {}, 1000);
+  } else if (model === "_fixture_oversized_protocol_") {
+    process.stdout.write("x".repeat(1_000_001) + "\n");
+  } else if (model === "_fixture_signaled_") {
+    process.kill(process.pid, "SIGTERM");
   } else if (model === "_fixture_invalid_model_") {
     process.stderr.write('Model "_fixture_invalid_model_" not found. Use --list-models to see available models.\n');
     process.exitCode = 1;
@@ -200,25 +210,30 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		try {
 			process.kill(pid, 0);
 			return true;
-		} catch {
-			return false;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "EPERM";
 		}
 	};
-	const readDescendantState = async (): Promise<{ pid: number; promptFile: string }> => {
+	const readDescendantState = async (): Promise<{ pid: number; rootPid: number; promptFile: string }> => {
 		const deadline = Date.now() + 5_000;
 		while (Date.now() < deadline) {
 			try {
-				const state = JSON.parse(await readFile(pidFile, "utf8")) as { pid?: unknown; promptFile?: unknown };
-				if (Number.isInteger(state.pid) && (state.pid as number) > 0 && typeof state.promptFile === "string") {
+				const state = JSON.parse(await readFile(pidFile, "utf8")) as { pid?: unknown; rootPid?: unknown; promptFile?: unknown };
+				if (
+					Number.isInteger(state.pid) && (state.pid as number) > 0
+					&& Number.isInteger(state.rootPid) && (state.rootPid as number) > 0
+					&& typeof state.promptFile === "string"
+				) {
 					descendantPids.add(state.pid as number);
-					return state as { pid: number; promptFile: string };
+					descendantPids.add(state.rootPid as number);
+					return state as { pid: number; rootPid: number; promptFile: string };
 				}
 			} catch {
 				/* wait for the fake child to spawn its descendant */
 			}
 			await delay(20);
 		}
-		throw new Error("Fake Pi did not report its descendant state");
+		throw new Error("Fake Pi did not report its process-tree state");
 	};
 	const waitForProcessExit = async (pid: number) => {
 		const deadline = Date.now() + 5_000;
@@ -542,6 +557,59 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		});
 	}
 
+	await t.test("adds bounded recovery diagnostics to abnormal child results without retaining assistant text", async () => {
+		await assert.rejects(
+			tool.execute("provider-recovery-test", { task, model: "_fixture_provider_error_" }, undefined, undefined, ctx),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^Provider rejected the request/);
+				assert.match(error.message, /- reason: abnormal-exit/);
+				assert.match(error.message, /- final child response received: yes/);
+				assert.match(error.message, /- process-tree termination: not attempted/);
+				assert.doesNotMatch(error.message, /Incomplete answer that must not be returned as a success/);
+				return true;
+			},
+		);
+	});
+
+	await t.test("does not silently accept oversized protocol output", async () => {
+		await assert.rejects(
+			tool.execute("oversized-protocol-test", { task, model: "_fixture_oversized_protocol_" }, undefined, undefined, ctx),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /Subagent protocol output exceeded 1000000 characters/);
+				assert.match(error.message, /- reason: abnormal-exit/);
+				return true;
+			},
+		);
+	});
+
+	await t.test("reports unexpected signal termination as an abnormal child failure", async () => {
+		await assert.rejects(
+			tool.execute("signal-test", { task, model: "_fixture_signaled_" }, undefined, undefined, ctx),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, process.platform === "win32" ? /Subagent exited with code 1/ : /Subagent terminated by signal SIGTERM/);
+				assert.match(error.message, /- reason: abnormal-exit/);
+				return true;
+			},
+		);
+	});
+
+	await t.test("reports only the latest assistant state as final-response evidence", async () => {
+		await assert.rejects(
+			tool.execute("retry-timeout-test", { task, model: "_fixture_error_then_hang_", timeoutMs: 1_000 }, undefined, undefined, ctx),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /- reason: timeout/);
+				assert.match(error.message, /- final child response received: no/);
+				assert.match(error.message, /- latest assistant stop reason: toolUse/);
+				assert.doesNotMatch(error.message, /Earlier terminal error|Retry is still running/);
+				return true;
+			},
+		);
+	});
+
 	await t.test("accepts a successful response after Pi recovers from a transient failure", async () => {
 		const invocation = await invoke({ task, model: "_fixture_recovered_" });
 		assert.equal(invocation.task, task);
@@ -561,7 +629,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 			tool.execute("lease-owner", { task, model: "_fixture_hanging_tree_" }, controller.signal, undefined, ctx),
 			/Subagent aborted by caller/,
 		);
-		let state: { pid: number; promptFile: string } | undefined;
+		let state: { pid: number; rootPid: number; promptFile: string } | undefined;
 		try {
 			state = await readDescendantState();
 
@@ -583,38 +651,64 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 			await owner;
 			if (state) {
 				await waitForProcessExit(state.pid);
+				await waitForProcessExit(state.rootPid);
 				await assert.rejects(access(state.promptFile));
 			}
 		}
 		await invoke({ task, access: "workspace-write" });
 	});
 
-	await t.test("times out a hanging child and terminates its descendant process", async () => {
+	await t.test("times out a progressing child, reports bounded recovery evidence, and terminates its process tree", async () => {
 		await rm(pidFile, { force: true });
+		const updates: AgentToolResult[] = [];
 		const rejection = assert.rejects(
-			tool.execute("timeout-test", { task, model: "_fixture_hanging_tree_", timeoutMs: 1_000 }, undefined, undefined, ctx),
-			/Subagent timed out after 1000ms/,
+			tool.execute("timeout-test", { task, model: "_fixture_hanging_tree_", timeoutMs: 1_000 }, undefined, (update) => updates.push(update), ctx),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^Subagent timed out after 1000ms/);
+				assert.match(error.message, /Recovery diagnostics \(bounded\):\n- reason: timeout\n- elapsed: \d+ms\n- requested model: _fixture_hanging_tree_\n- access: workspace-write/);
+				assert.match(error.message, /requested deadline: 1000ms/);
+				assert.match(error.message, /final child response received: no/);
+				assert.match(error.message, /assistant message_end observed: yes/);
+				assert.match(error.message, /progress tail: last 1 entry\n  - \+\d+ms Turn 1: thinking\.\.\./);
+				assert.match(error.message, /root process exit observed: yes/);
+				assert.match(error.message, process.platform === "win32" ? /taskkill completed \(exit 0\)/ : /process-group requested/);
+				assert.match(error.message, /known descendants after cleanup: unavailable/);
+				assert.doesNotMatch(error.message, /Starting bounded work/);
+				return true;
+			},
 		);
-		const { pid, promptFile } = await readDescendantState();
+		const { pid, rootPid, promptFile } = await readDescendantState();
 		assert.equal(isProcessRunning(pid), true);
+		assert.equal(isProcessRunning(rootPid), true);
 		await rejection;
 		await waitForProcessExit(pid);
+		await waitForProcessExit(rootPid);
 		await assert.rejects(access(promptFile));
+		assert.match(updates.at(-1)?.content[0].text ?? "", /Starting bounded work/);
 		await invoke({ task, access: "workspace-write" });
 	});
 
-	await t.test("caller abort terminates the child process tree with a distinct error", async () => {
+	await t.test("caller abort reports distinct recovery evidence and terminates the child process tree", async () => {
 		await rm(pidFile, { force: true });
 		const controller = new AbortController();
 		const rejection = assert.rejects(
 			tool.execute("abort-tree-test", { task, model: "_fixture_hanging_tree_" }, controller.signal, undefined, ctx),
-			/Subagent aborted by caller/,
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^Subagent aborted by caller/);
+				assert.match(error.message, /- reason: caller-abort/);
+				assert.match(error.message, /- requested model: _fixture_hanging_tree_/);
+				return true;
+			},
 		);
-		const { pid, promptFile } = await readDescendantState();
+		const { pid, rootPid, promptFile } = await readDescendantState();
 		assert.equal(isProcessRunning(pid), true);
+		assert.equal(isProcessRunning(rootPid), true);
 		controller.abort();
 		await rejection;
 		await waitForProcessExit(pid);
+		await waitForProcessExit(rootPid);
 		await assert.rejects(access(promptFile));
 		await invoke({ task, access: "workspace-write" });
 	});
