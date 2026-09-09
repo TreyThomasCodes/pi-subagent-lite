@@ -95,6 +95,7 @@ For a bounded implementation task with skills:
 {
   "task": "Objective: fix the confirmed stale-session bug.\nScope: src/auth.ts and test/auth.test.ts.\nAccess expectations: modify only those files.\nExclusions: no dependency, configuration, or public API changes.\nVerification: run the focused auth test command and report its exact outcome.\nStopping conditions: stop and report a blocker if the fix requires broader schema or API changes.\nReport format: changed files, implementation summary, commands actually run with outcomes, blockers, and uncertainty.",
   "access": "workspace-write",
+  "allowedPaths": ["src/auth.ts", "test/auth.test.ts"],
   "timeoutMs": 600000,
   "skills": ["code-review"]
 }
@@ -122,6 +123,14 @@ The selected mode is shown in the tool call and initial progress update. These m
 Within one extension process, only one `workspace-write` subagent may run against a resolved working directory at a time. A second same-directory writer is rejected immediately with guidance to wait, use `read-only`, or choose a different working directory; calls are not silently queued. The lease is released after success, child failure, timeout, caller cancellation, or spawn failure. Read-only calls do not take a mutation lease, and writers using different working directories do not contend.
 
 This is a local coordination guard, not a filesystem lock or sandbox. It cannot stop the parent agent, another Pi/extension process, or an external tool from writing concurrently. Different working directories may still target the same files because `workspace-write` does not confine filesystem access. The extension does not create Git worktrees or impose repository-specific execution phases.
+
+### Observing a workspace-write scope
+
+`allowedPaths` is an optional `workspace-write` contract of cwd-relative path patterns, such as `src/auth.ts`, `test/*.test.ts`, or `src/**`. It supports `*` within one path segment, `?` for one non-separator character, and `**` as an entire recursive segment. Absolute paths, `.`/`..`, empty segments, and partial `**` patterns are rejected before a child starts. An empty array means no changed path is allowed.
+
+The extension snapshots Git-tracked, staged, and non-ignored untracked files immediately before and after the child. It returns a structured `workspaceChanges` detail and an appended human-readable report with the observed changed paths and any paths outside the contract. The report is attached to normal results and to child failures, timeouts, and cancellations. Rename-like changes are reported as their removed and added paths; the tool does not infer a rename operation.
+
+This is **observational**, not a sandbox or rollback mechanism: a violating child is not stopped, writes are not reverted, ignored files are not inventoried, and concurrent external changes cannot be attributed with certainty. Git must be available and the cwd must be inside a usable worktree. If discovery or the bounded snapshot cannot run, the result explicitly says the observation is `unavailable` or `partial` rather than claiming scope enforcement. Large files, very large worktrees, and Gitlink/submodule directory contents are likewise reported as incomplete rather than read without limit.
 
 ### Setting a deadline
 
@@ -172,6 +181,7 @@ Or specify it in a `subagent` tool call, with or without skills:
 | `model` | `string` | No | A Pi selector, preferably one returned by `subagent_models`; preflighted with the same child Pi executable before passing it via `--model`; omitted uses the child Pi process's normal model selection |
 | `thinking` | `"off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | No | Child thinking level, passed via `--thinking` and displayed beside the model |
 | `timeoutMs` | `integer` | No | Maximum child runtime in milliseconds, from `1000` through `86400000`; omitted means no extension-imposed deadline |
+| `allowedPaths` | `string[]` | No | Cwd-relative glob-like patterns observed for net Git changes; workspace-write only. Reports violations but does not sandbox or revert them. |
 | `skills` | `string[]` | No | Optional skill paths or names to load via `--skill` |
 
 ## License
