@@ -19,6 +19,12 @@ const MAX_TASK_ARG_LENGTH = 4000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
 const MIN_SUBAGENT_TIMEOUT_MS = 1_000;
 const MAX_SUBAGENT_TIMEOUT_MS = 86_400_000;
+const RECOVERY_PROGRESS_LIMIT = 8;
+const RECOVERY_CLEANUP_GRACE_MS = 5_000;
+const TASKKILL_GRACE_MS = 2_000;
+const MAX_DIAGNOSTIC_DETAIL_LENGTH = 240;
+const MAX_PROTOCOL_BUFFER_LENGTH = 1_000_000;
+const MAX_STDERR_TAIL_LENGTH = 4_000;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 const ACCESS_MODES = ["read-only", "workspace-write"] as const;
@@ -114,31 +120,29 @@ export function getMessageText(message: Pick<AgentMessage, "content">): string {
 		.join("");
 }
 
-export function formatAssistantProgress(message: AgentMessage, turnCount: number): string {
+function formatProgressSummary(message: AgentMessage, turnCount: number): string {
 	const content = Array.isArray(message.content) ? message.content : [];
 	const toolCalls = content.filter((part) => part?.type === "toolCall");
-	let updateText: string;
+	if (toolCalls.length === 0) return `Turn ${turnCount}: thinking...`;
 
-	if (toolCalls.length > 0) {
-		const counts = new Map<string, number>();
-		for (const call of toolCalls) {
-			const name = typeof call.name === "string" && call.name ? call.name : "unknown tool";
-			counts.set(name, (counts.get(name) || 0) + 1);
-		}
-		const tools = Array.from(counts.entries())
-			.map(([name, count]) => (count > 1 ? `${name} (x${count})` : name))
-			.join(", ");
-		updateText = `Turn ${turnCount}: ${tools}`;
-	} else {
-		updateText = `Turn ${turnCount}: thinking...`;
+	const counts = new Map<string, number>();
+	for (const call of toolCalls) {
+		const name = typeof call.name === "string" && call.name ? call.name : "unknown tool";
+		counts.set(name, (counts.get(name) || 0) + 1);
 	}
+	const tools = Array.from(counts.entries())
+		.map(([name, count]) => (count > 1 ? `${name} (x${count})` : name))
+		.join(", ");
+	return `Turn ${turnCount}: ${tools}`;
+}
 
+export function formatAssistantProgress(message: AgentMessage, turnCount: number): string {
+	let updateText = formatProgressSummary(message, turnCount);
 	const text = getMessageText(message);
 	if (text) {
 		const preview = text.length > 60 ? text.slice(0, 60) + "..." : text;
 		updateText += `\n${preview}`;
 	}
-
 	return updateText;
 }
 
@@ -162,36 +166,170 @@ export function getPiInvocation(
 	return { command: "pi", args };
 }
 
-const terminatingProcesses = new WeakSet<ChildProcess>();
+type TerminationMethod = "process-group" | "taskkill" | "direct-kill";
+type TerminationOutcome = "requested" | "completed" | "failed" | "timed-out";
+type TerminationAttempt = {
+	method: TerminationMethod;
+	outcome: TerminationOutcome;
+	exitCode?: number | null;
+	detail?: string;
+};
+type TerminationReport = {
+	attempts: TerminationAttempt[];
+};
 
-function terminateProcessTree(proc: ChildProcess): void {
-	if (terminatingProcesses.has(proc)) return;
-	terminatingProcesses.add(proc);
+const terminatingProcesses = new WeakMap<ChildProcess, Promise<TerminationReport>>();
 
-	const pid = proc.pid;
-	if (pid === undefined) {
-		proc.kill("SIGKILL");
-		return;
+function diagnosticDetail(error: unknown): string {
+	const detail = error instanceof Error ? error.message : String(error);
+	const normalized = detail.replace(/\s+/g, " ").trim();
+	return normalized.length > MAX_DIAGNOSTIC_DETAIL_LENGTH
+		? `${normalized.slice(0, MAX_DIAGNOSTIC_DETAIL_LENGTH)}...`
+		: normalized;
+}
+
+function appendBoundedTail(existing: string, addition: string, limit: number): string {
+	const combined = existing + addition;
+	return combined.length > limit ? combined.slice(-limit) : combined;
+}
+
+function terminateProcessDirectly(proc: ChildProcess): TerminationAttempt {
+	try {
+		return { method: "direct-kill", outcome: proc.kill("SIGKILL") ? "requested" : "failed" };
+	} catch (error) {
+		return { method: "direct-kill", outcome: "failed", detail: diagnosticDetail(error) };
 	}
+}
 
-	if (process.platform === "win32") {
+function terminateWindowsProcessTree(proc: ChildProcess, pid: number): Promise<TerminationReport> {
+	return new Promise((resolve) => {
+		let settled = false;
+		let taskkill: ChildProcess | undefined;
+		let timeout: NodeJS.Timeout | undefined;
+		const finish = (attempts: TerminationAttempt[]) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			resolve({ attempts });
+		};
+		const fallback = (attempt: TerminationAttempt) => finish([attempt, terminateProcessDirectly(proc)]);
+
 		try {
-			const taskkill = spawn(
+			taskkill = spawn(
 				path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
 				["/F", "/T", "/PID", String(pid)],
-				{ stdio: "ignore", detached: true, windowsHide: true },
+				{ stdio: "ignore", windowsHide: true },
 			);
-			taskkill.once("error", () => proc.kill("SIGKILL"));
-		} catch {
-			proc.kill("SIGKILL");
+		} catch (error) {
+			fallback({ method: "taskkill", outcome: "failed", detail: diagnosticDetail(error) });
+			return;
 		}
-		return;
-	}
 
-	try {
-		process.kill(-pid, "SIGKILL");
-	} catch {
-		proc.kill("SIGKILL");
+		taskkill.once("error", (error) => fallback({ method: "taskkill", outcome: "failed", detail: diagnosticDetail(error) }));
+		taskkill.once("close", (code) => {
+			if (code === 0) finish([{ method: "taskkill", outcome: "completed", exitCode: code }]);
+			else fallback({ method: "taskkill", outcome: "failed", exitCode: code });
+		});
+		timeout = setTimeout(() => {
+			try {
+				taskkill?.kill("SIGKILL");
+			} catch {
+				/* best effort */
+			}
+			fallback({ method: "taskkill", outcome: "timed-out" });
+		}, TASKKILL_GRACE_MS);
+		timeout.unref();
+	});
+}
+
+function terminateProcessTree(proc: ChildProcess): Promise<TerminationReport> {
+	const existing = terminatingProcesses.get(proc);
+	if (existing) return existing;
+
+	const pid = proc.pid;
+	let termination: Promise<TerminationReport>;
+	if (pid === undefined) {
+		termination = Promise.resolve({ attempts: [terminateProcessDirectly(proc)] });
+	} else if (process.platform === "win32") {
+		termination = terminateWindowsProcessTree(proc, pid);
+	} else {
+		try {
+			process.kill(-pid, "SIGKILL");
+			termination = Promise.resolve({ attempts: [{ method: "process-group", outcome: "requested" }] });
+		} catch (error) {
+			termination = Promise.resolve({
+				attempts: [
+					{ method: "process-group", outcome: "failed", detail: diagnosticDetail(error) },
+					terminateProcessDirectly(proc),
+				],
+			});
+		}
+	}
+	terminatingProcesses.set(proc, termination);
+	return termination;
+}
+
+type RecoveryReason = "timeout" | "caller-abort" | "abnormal-exit";
+type RecoveryProgress = {
+	elapsedMs: number;
+	turn: number;
+	summary: string;
+};
+type RecoveryDiagnostics = {
+	reason: RecoveryReason;
+	elapsedMs: number;
+	model?: string;
+	access: AccessMode;
+	timeoutMs?: number;
+	progressTail: RecoveryProgress[];
+	droppedProgressEntries: number;
+	assistantMessageEndObserved: boolean;
+	finalAssistantResponseReceived: boolean;
+	lastAssistantStopReason?: string;
+	termination?: TerminationReport;
+	rootExitObserved: boolean;
+	cleanupDeadlineExceeded: boolean;
+};
+
+function formatRecoveryDiagnostics(diagnostics: RecoveryDiagnostics): string {
+	const lines = [
+		"Recovery diagnostics (bounded):",
+		`- reason: ${diagnostics.reason}`,
+		`- elapsed: ${diagnostics.elapsedMs}ms`,
+		`- requested model: ${diagnostics.model ?? "Pi default"}`,
+		`- access: ${diagnostics.access}`,
+		`- requested deadline: ${diagnostics.timeoutMs === undefined ? "none" : `${diagnostics.timeoutMs}ms`}`,
+		`- final child response received: ${diagnostics.finalAssistantResponseReceived ? "yes" : "no"}`,
+		`- assistant message_end observed: ${diagnostics.assistantMessageEndObserved ? "yes" : "no"}`,
+		"- session/log locator: unavailable (--no-session)",
+	];
+	if (diagnostics.lastAssistantStopReason) lines.push(`- latest assistant stop reason: ${diagnostics.lastAssistantStopReason}`);
+	if (diagnostics.progressTail.length === 0) {
+		lines.push("- progress tail: no assistant progress observed");
+	} else {
+		lines.push(`- progress tail: last ${diagnostics.progressTail.length} entr${diagnostics.progressTail.length === 1 ? "y" : "ies"}${diagnostics.droppedProgressEntries ? ` (${diagnostics.droppedProgressEntries} earlier entr${diagnostics.droppedProgressEntries === 1 ? "y" : "ies"} omitted)` : ""}`);
+		for (const progress of diagnostics.progressTail) lines.push(`  - +${progress.elapsedMs}ms ${progress.summary}`);
+	}
+	if (diagnostics.termination) {
+		const attempts = diagnostics.termination.attempts.map((attempt) => {
+			const exitCode = attempt.exitCode === undefined ? "" : ` (exit ${attempt.exitCode ?? "unknown"})`;
+			const detail = attempt.detail ? `: ${attempt.detail}` : "";
+			return `${attempt.method} ${attempt.outcome}${exitCode}${detail}`;
+		});
+		lines.push(`- process-tree termination: ${attempts.join("; ")}`);
+		lines.push(`- root process exit observed: ${diagnostics.rootExitObserved ? "yes" : "no"}`);
+		lines.push("- known descendants after cleanup: unavailable (the extension has no descendant PID inventory)");
+		if (diagnostics.cleanupDeadlineExceeded) lines.push("- cleanup grace period elapsed; the root process may still be running");
+	} else {
+		lines.push("- process-tree termination: not attempted");
+	}
+	return lines.join("\n");
+}
+
+class SubagentRecoveryError extends Error {
+	constructor(message: string, readonly diagnostics: RecoveryDiagnostics) {
+		super(`${message}\n\n${formatRecoveryDiagnostics(diagnostics)}`);
+		this.name = "SubagentRecoveryError";
 	}
 }
 
@@ -375,7 +513,7 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal, modelSelect
 				if (Array.isArray(data?.models)) models = data.models;
 				else rpcError = "Model discovery response did not include models";
 			}
-			terminateProcessTree(proc);
+			void terminateProcessTree(proc);
 		} catch {
 			// RPC extensions may emit non-protocol output; only a correlated response matters.
 		}
@@ -385,11 +523,11 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal, modelSelect
 		let settled = false;
 		const onAbort = () => {
 			aborted = true;
-			terminateProcessTree(proc);
+			void terminateProcessTree(proc);
 		};
 		const timeout = setTimeout(() => {
 			timedOut = true;
-			terminateProcessTree(proc);
+			void terminateProcessTree(proc);
 		}, MODEL_DISCOVERY_TIMEOUT_MS);
 		timeout.unref();
 		const finish = (code: number) => {
@@ -424,14 +562,14 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal, modelSelect
 		});
 		if (!proc.stdin) {
 			spawnError = new Error("Pi RPC stdin is unavailable");
-			terminateProcessTree(proc);
+			void terminateProcessTree(proc);
 			finish(1);
 			return;
 		}
 		proc.stdin.once("error", (error) => {
 			stdinError = error;
 			if (!models && !rpcError) {
-				terminateProcessTree(proc);
+				void terminateProcessTree(proc);
 				finish(1);
 			}
 		});
@@ -440,7 +578,7 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal, modelSelect
 			proc.stdin.write(`${JSON.stringify({ id: requestId, type: "get_available_models" })}\n`);
 		} catch (error) {
 			stdinError = error instanceof Error ? error : new Error(String(error));
-			terminateProcessTree(proc);
+			void terminateProcessTree(proc);
 			finish(1);
 		}
 	});
@@ -556,17 +694,48 @@ async function runSubagent(
 			env: { ...process.env, PI_SUBAGENT_LITE_DISABLE: "true" },
 		});
 
+		const startedAt = Date.now();
+		const stdoutDecoder = new StringDecoder("utf8");
+		const stderrDecoder = new StringDecoder("utf8");
 		let buffer = "";
 		let stderr = "";
 		let spawnError: Error | undefined;
 		let lastAssistantText = "";
 		let lastAssistantError: string | undefined;
+		let lastAssistantStopReason: string | undefined;
+		let assistantMessageEndObserved = false;
+		let finalAssistantResponseReceived = false;
+		let protocolOutputOverflowed = false;
+		let childExitSignal: NodeJS.Signals | null = null;
 		let turnCount = 0;
+		const progressTail: RecoveryProgress[] = [];
+		let droppedProgressEntries = 0;
+		let rootExitObserved = false;
+		let cleanupDeadlineExceeded = false;
+		let terminationReason: "caller-abort" | "timeout" | undefined;
+		let terminationPromise: Promise<TerminationReport> | undefined;
 
+		const recordProgress = (message: AgentMessage) => {
+			turnCount++;
+			const progress: RecoveryProgress = {
+				elapsedMs: Math.max(0, Date.now() - startedAt),
+				turn: turnCount,
+				summary: diagnosticDetail(formatProgressSummary(message, turnCount)),
+			};
+			if (progressTail.length === RECOVERY_PROGRESS_LIMIT) {
+				progressTail.shift();
+				droppedProgressEntries++;
+			}
+			progressTail.push(progress);
+			return progress;
+		};
 		const processLine = (line: string) => {
 			const message = parseMessageEnd(line);
 			if (!message || message.role !== "assistant") return;
 
+			assistantMessageEndObserved = true;
+			lastAssistantStopReason = message.stopReason;
+			finalAssistantResponseReceived = message.stopReason !== "toolUse";
 			// JSON mode may exit zero after a provider error. A later successful
 			// response clears the error if Pi's automatic retry recovers.
 			lastAssistantError = message.stopReason === "error" || message.stopReason === "aborted"
@@ -575,51 +744,104 @@ async function runSubagent(
 			const text = getMessageText(message);
 			if (text && !lastAssistantError) lastAssistantText = text;
 
+			recordProgress(message);
 			if (onUpdate) {
-				turnCount++;
 				onUpdate({
 					content: [{ type: "text", text: formatAssistantProgress(message, turnCount) }],
 				});
 			}
 		};
 
-		const onStdoutData = (data: Buffer) => {
-			buffer += data.toString();
+		const processStdout = (text: string) => {
+			buffer += text;
 			const lines = buffer.split("\n");
 			buffer = lines.pop() || "";
-			for (const line of lines) processLine(line);
+			for (const line of lines) {
+				if (line.length > MAX_PROTOCOL_BUFFER_LENGTH) {
+					protocolOutputOverflowed = true;
+					continue;
+				}
+				processLine(line);
+			}
+			if (buffer.length > MAX_PROTOCOL_BUFFER_LENGTH) {
+				protocolOutputOverflowed = true;
+				buffer = "";
+			}
 		};
+		const onStdoutData = (data: Buffer) => processStdout(stdoutDecoder.write(data));
 		const onStderrData = (data: Buffer) => {
-			stderr += data.toString();
+			stderr = appendBoundedTail(stderr, stderrDecoder.write(data), MAX_STDERR_TAIL_LENGTH);
 		};
 		proc.stdout.on("data", onStdoutData);
 		proc.stderr.on("data", onStderrData);
 
-		let terminationReason: "caller-abort" | "timeout" | undefined;
+		const disposeProcessResources = () => {
+			try {
+				proc.stdout.destroy();
+				proc.stderr.destroy();
+				proc.unref();
+			} catch {
+				/* best effort after a bounded cleanup failure */
+			}
+		};
+		const buildRecoveryDiagnostics = (reason: RecoveryReason, termination?: TerminationReport): RecoveryDiagnostics => ({
+			reason,
+			elapsedMs: Math.max(0, Date.now() - startedAt),
+			model: modelSelector,
+			access,
+			timeoutMs,
+			progressTail,
+			droppedProgressEntries,
+			assistantMessageEndObserved,
+			finalAssistantResponseReceived,
+			lastAssistantStopReason,
+			termination,
+			rootExitObserved,
+			cleanupDeadlineExceeded,
+		});
 		const exitCode = await new Promise<number>((resolve) => {
 			let settled = false;
 			let timeoutHandle: NodeJS.Timeout | undefined;
+			let cleanupHandle: NodeJS.Timeout | undefined;
 			const terminate = (reason: "caller-abort" | "timeout") => {
 				if (settled || terminationReason) return;
 				terminationReason = reason;
-				terminateProcessTree(proc);
+				terminationPromise = terminateProcessTree(proc);
+				cleanupHandle = setTimeout(() => {
+					cleanupDeadlineExceeded = true;
+					disposeProcessResources();
+					finish(1);
+				}, RECOVERY_CLEANUP_GRACE_MS);
+				cleanupHandle.unref();
 			};
 			const onAbort = () => terminate("caller-abort");
 			const finish = (code: number) => {
 				if (settled) return;
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
+				if (cleanupHandle) clearTimeout(cleanupHandle);
 				signal?.removeEventListener("abort", onAbort);
+				proc.removeListener("exit", onExit);
 				proc.removeListener("close", onClose);
 				proc.removeListener("error", onProcessError);
 				proc.stdout.removeListener("data", onStdoutData);
 				proc.stderr.removeListener("data", onStderrData);
 				resolve(code);
 			};
-			const onClose = (code: number | null) => {
+			const onExit = (_code: number | null, signal: NodeJS.Signals | null) => {
+				rootExitObserved = true;
+				childExitSignal = signal;
+			};
+			const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
 				if (settled) return;
+				if (!rootExitObserved) {
+					rootExitObserved = true;
+					childExitSignal = signal;
+				}
+				processStdout(stdoutDecoder.end());
+				stderr = appendBoundedTail(stderr, stderrDecoder.end(), MAX_STDERR_TAIL_LENGTH);
 				if (buffer.trim()) processLine(buffer);
-				finish(code ?? 0);
+				finish(code ?? (signal ? 1 : 0));
 			};
 			const onProcessError = (error: Error) => {
 				spawnError = error;
@@ -633,17 +855,26 @@ async function runSubagent(
 			if (signal?.aborted) onAbort();
 			else signal?.addEventListener("abort", onAbort, { once: true });
 
+			proc.once("exit", onExit);
 			proc.once("close", onClose);
 			proc.once("error", onProcessError);
 		});
 
-		if (terminationReason === "caller-abort") throw new Error("Subagent aborted by caller");
-		if (terminationReason === "timeout") throw new Error(`Subagent timed out after ${timeoutMs}ms`);
-
-		if (exitCode !== 0) {
-			throw spawnError ?? new Error(stderr.trim() || lastAssistantError || `Subagent exited with code ${exitCode}`);
+		if (terminationReason) {
+			const termination = await terminationPromise;
+			const diagnostics = buildRecoveryDiagnostics(terminationReason, termination);
+			if (terminationReason === "caller-abort") throw new SubagentRecoveryError("Subagent aborted by caller", diagnostics);
+			throw new SubagentRecoveryError(`Subagent timed out after ${timeoutMs}ms`, diagnostics);
 		}
-		if (lastAssistantError) throw new Error(lastAssistantError);
+
+		const protocolFailure = protocolOutputOverflowed
+			? new Error(`Subagent protocol output exceeded ${MAX_PROTOCOL_BUFFER_LENGTH} characters`)
+			: undefined;
+		const signalFailure = childExitSignal ? new Error(`Subagent terminated by signal ${childExitSignal}`) : undefined;
+		const failure = exitCode !== 0
+			? spawnError ?? protocolFailure ?? signalFailure ?? new Error(stderr.trim() || lastAssistantError || `Subagent exited with code ${exitCode}`)
+			: protocolFailure ?? signalFailure ?? (lastAssistantError ? new Error(lastAssistantError) : undefined);
+		if (failure) throw new SubagentRecoveryError(diagnosticDetail(failure), buildRecoveryDiagnostics("abnormal-exit"));
 
 		return lastAssistantText;
 	} finally {
