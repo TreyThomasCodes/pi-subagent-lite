@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added `repository-read` access with fixed structured Git status/diff/show/log wrappers and opt-in GitHub issue/pull-request views, without exposing arbitrary shell, Git, or `gh` commands.
 - Added optional `allowedPaths` workspace-write contracts with bounded Git-based net-change reports, nested-cwd support, explicit unavailable/partial diagnostics, and out-of-scope path flags; reports are observational and do not sandbox or roll back writes.
 - Added bounded timeout, cancellation, and abnormal-exit recovery diagnostics with sanitized progress tails, root-exit evidence, and explicit process-tree verification limits.
 - Preflight explicit model selectors with the same Pi runtime used by `subagent_models`, preserving native selector resolution and rejecting invalid selections before a task child starts.

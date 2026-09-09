@@ -34,12 +34,20 @@ const MAX_WORKSPACE_FILE_BYTES = 16_000_000;
 const MAX_WORKSPACE_SNAPSHOT_BYTES = 64_000_000;
 const MAX_WORKSPACE_SNAPSHOT_DURATION_MS = 10_000;
 const GIT_OBSERVATION_TIMEOUT_MS = 10_000;
+const REPOSITORY_READ_TIMEOUT_MS = 10_000;
+const MAX_REPOSITORY_READ_OUTPUT_BYTES = 50 * 1024;
+const MAX_REPOSITORY_READ_OUTPUT_LINES = 2_000;
+const MAX_REPOSITORY_READ_LOG_ENTRIES = 100;
+const MAX_REPOSITORY_READ_REVISION_LENGTH = 128;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
-const ACCESS_MODES = ["read-only", "workspace-write"] as const;
+const ACCESS_MODES = ["read-only", "repository-read", "workspace-write"] as const;
 type AccessMode = (typeof ACCESS_MODES)[number];
 const DEFAULT_ACCESS_MODE: AccessMode = "workspace-write";
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
+const REPOSITORY_GIT_TOOLS = ["repository_git_status", "repository_git_diff", "repository_git_show", "repository_git_log"] as const;
+const REPOSITORY_GITHUB_TOOLS = ["repository_github_issue_view", "repository_github_pull_request_view"] as const;
+const REPOSITORY_GIT_READ_CONFIG = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"] as const;
 const activeWorkspaceWriteLeases = new Set<string>();
 
 function getWorkspaceLeaseKey(cwd: string): string {
@@ -213,6 +221,147 @@ async function runGit(cwd: string, args: string[]): Promise<Buffer> {
 			else finish(new Error(`Git observation failed${code === null ? "" : ` with code ${code}`}${stderr.trim() ? `: ${diagnosticDetail(stderr)}` : ""}`));
 		});
 	});
+}
+
+type RepositoryReadExecutable = "git" | "gh";
+
+function formatRepositoryReadOutput(chunks: Buffer[], outputTruncatedByBytes: boolean): string {
+	const raw = Buffer.concat(chunks).toString("utf8");
+	const lines = raw.split("\n");
+	const outputTruncatedByLines = lines.length > MAX_REPOSITORY_READ_OUTPUT_LINES;
+	const content = (outputTruncatedByLines ? lines.slice(0, MAX_REPOSITORY_READ_OUTPUT_LINES) : lines).join("\n").trimEnd();
+	if (!outputTruncatedByBytes && !outputTruncatedByLines) return content || "(no output)";
+	return `${content || "(no output)"}\n\n[Output truncated to ${MAX_REPOSITORY_READ_OUTPUT_LINES} lines or ${MAX_REPOSITORY_READ_OUTPUT_BYTES} bytes.]`;
+}
+
+export function classifyRepositoryReadFailure(executable: RepositoryReadExecutable, detail: string): Error {
+	const normalized = detail.trim() || "unknown failure";
+	if (/\benoent\b/i.test(normalized)) {
+		return new Error(executable === "git" ? "Git executable is unavailable" : "GitHub CLI (gh) is unavailable");
+	}
+	if (executable === "git") {
+		if (/not a git repository|outside repository/i.test(normalized)) {
+			return new Error("Git repository read unavailable: cwd is not inside a Git worktree");
+		}
+		return new Error(`Git repository read failed: ${diagnosticDetail(normalized)}`);
+	}
+	if (/not logged into any GitHub hosts|authentication failed|bad credentials|HTTP 401|HTTP 403/i.test(normalized)) {
+		return new Error(`GitHub read authentication failed: ${diagnosticDetail(normalized)}`);
+	}
+	if (/network|connection|timeout|timed out|could not resolve|ENOTFOUND|ECONNREFUSED|HTTP 5\d\d/i.test(normalized)) {
+		return new Error(`GitHub read network request failed: ${diagnosticDetail(normalized)}`);
+	}
+	return new Error(`GitHub repository read failed: ${diagnosticDetail(normalized)}`);
+}
+
+async function runRepositoryReadCommand(
+	executable: RepositoryReadExecutable,
+	args: string[],
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	if (signal?.aborted) throw new Error("Repository read aborted by caller");
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let timeout: NodeJS.Timeout | undefined;
+		let capturedBytes = 0;
+		let outputTruncatedByBytes = false;
+		let stderr = "";
+		const stdout: Buffer[] = [];
+		const finish = (error?: Error, output?: string) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			signal?.removeEventListener("abort", onAbort);
+			if (error) reject(error);
+			else resolve(output ?? "(no output)");
+		};
+		let proc: ChildProcess;
+		const stop = () => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				/* best effort */
+			}
+		};
+		const onAbort = () => {
+			stop();
+			finish(new Error("Repository read aborted by caller"));
+		};
+		try {
+			proc = spawn(executable, args, {
+				cwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+				env: {
+					...process.env,
+					GIT_OPTIONAL_LOCKS: "0",
+					GIT_PAGER: "cat",
+					GIT_TERMINAL_PROMPT: "0",
+					GH_PAGER: "cat",
+					GH_NO_UPDATE_NOTIFIER: "1",
+				},
+			});
+		} catch (error) {
+			finish(new Error(`${executable === "gh" ? "GitHub CLI (gh)" : "Git"} is unavailable: ${diagnosticDetail(error)}`));
+			return;
+		}
+		timeout = setTimeout(() => {
+			stop();
+			finish(new Error(`Repository read timed out after ${REPOSITORY_READ_TIMEOUT_MS}ms`));
+		}, REPOSITORY_READ_TIMEOUT_MS);
+		timeout.unref();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		proc.stdout?.on("data", (chunk: Buffer) => {
+			if (capturedBytes >= MAX_REPOSITORY_READ_OUTPUT_BYTES) {
+				outputTruncatedByBytes = true;
+				return;
+			}
+			const remaining = MAX_REPOSITORY_READ_OUTPUT_BYTES - capturedBytes;
+			const captured = chunk.subarray(0, remaining);
+			capturedBytes += captured.length;
+			stdout.push(captured);
+			if (captured.length < chunk.length) outputTruncatedByBytes = true;
+		});
+		proc.stderr?.on("data", (chunk: Buffer) => {
+			stderr = appendBoundedTail(stderr, chunk.toString("utf8"), MAX_STDERR_TAIL_LENGTH);
+		});
+		proc.once("error", (error) => {
+			const unavailable = (error as NodeJS.ErrnoException).code === "ENOENT";
+			finish(unavailable
+				? new Error(`${executable === "gh" ? "GitHub CLI (gh)" : "Git"} is unavailable on PATH`)
+				: classifyRepositoryReadFailure(executable, diagnosticDetail(error)));
+		});
+		proc.once("close", (code) => {
+			if (code === 0) finish(undefined, formatRepositoryReadOutput(stdout, outputTruncatedByBytes));
+			else finish(classifyRepositoryReadFailure(executable, stderr || `process exited with code ${code ?? "unknown"}`));
+		});
+	});
+}
+
+function normalizeRepositoryReadRevision(revision: unknown): string {
+	if (revision === undefined) return "HEAD";
+	if (typeof revision !== "string" || revision.length === 0 || revision.length > MAX_REPOSITORY_READ_REVISION_LENGTH) {
+		throw new Error(`revision must be a non-empty Git ref or object ID up to ${MAX_REPOSITORY_READ_REVISION_LENGTH} characters`);
+	}
+	if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(revision) || revision.includes("..") || revision.includes("//") || revision.startsWith("-")) {
+		throw new Error("revision must be a simple Git ref or object ID, not a flag, range, pathspec, or command");
+	}
+	return revision;
+}
+
+function normalizeRepositoryReadCount(value: unknown): number {
+	if (value === undefined) return 20;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_REPOSITORY_READ_LOG_ENTRIES) {
+		throw new Error(`limit must be an integer between 1 and ${MAX_REPOSITORY_READ_LOG_ENTRIES}`);
+	}
+	return value;
+}
+
+function normalizeGitHubItemNumber(value: unknown, label: string): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive integer`);
+	return value;
 }
 
 async function getGitWorkspace(cwd: string): Promise<GitWorkspace> {
@@ -429,10 +578,12 @@ function appendWorkspaceChangeReportToError(error: unknown, report: WorkspaceCha
 	return new Error(`${message}\n\n${formatWorkspaceChangeReport(report)}`);
 }
 
-function getMinimalSystemPrompt(access: AccessMode, allowedPaths?: string[]): string {
+function getMinimalSystemPrompt(access: AccessMode, allowedPaths?: string[], githubRead = false): string {
 	const accessGuidance = access === "read-only"
 		? "You are in read-only access mode. Use only the available non-mutating tools and do not modify the workspace."
-		: "You are in workspace-write access mode. You may use the available tools to inspect and modify the workspace as the task requires.";
+		: access === "repository-read"
+			? `You are in repository-read access mode. Use only the available non-mutating filesystem and structured repository tools; shell, edit, and write tools are unavailable. Git${githubRead ? " and GitHub issue/pull-request" : ""} operations are fixed, parameterized read operations, not an arbitrary command interface. Do not modify the workspace or attempt to work around this boundary.`
+			: "You are in workspace-write access mode. You may use the available tools to inspect and modify the workspace as the task requires.";
 	const contractGuidance = allowedPaths
 		? `\nAn observational allowed-path contract applies: ${allowedPaths.map((value) => JSON.stringify(value)).join(", ") || "no changes are allowed"}. Keep edits within that contract. The parent reports net observed Git changes after the run; this is not a sandbox and does not undo edits.\n`
 		: "";
@@ -1000,6 +1151,7 @@ async function runSubagent(
 	thinking?: ThinkingLevel,
 	timeoutMs?: number,
 	allowedPaths?: string[],
+	githubRead?: boolean,
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult) => void,
 ): Promise<SubagentRunResult> {
@@ -1010,6 +1162,8 @@ async function runSubagent(
 	if (normalizedAllowedPaths !== undefined && access !== "workspace-write") {
 		throw new Error("allowedPaths is only supported with access: \"workspace-write\"");
 	}
+	if (githubRead !== undefined && typeof githubRead !== "boolean") throw new Error("githubRead must be a boolean");
+	if (githubRead !== undefined && access !== "repository-read") throw new Error("githubRead is only supported with access: \"repository-read\"");
 	if (signal?.aborted) throw new Error("Subagent aborted by caller");
 
 	const modelSelector = model?.trim();
@@ -1019,7 +1173,12 @@ async function runSubagent(
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (access === "read-only") args.push("--tools", READ_ONLY_TOOLS.join(","));
+	const childTools = access === "read-only"
+		? READ_ONLY_TOOLS
+		: access === "repository-read"
+			? [...READ_ONLY_TOOLS, ...REPOSITORY_GIT_TOOLS, ...(githubRead ? REPOSITORY_GITHUB_TOOLS : [])]
+			: undefined;
+	if (childTools) args.push("--tools", childTools.join(","));
 	if (modelSelector) {
 		// Pi performs its native resolution again when launching the task child;
 		// the preflight is advisory because configuration can change in between.
@@ -1050,6 +1209,7 @@ async function runSubagent(
 			modelSelector && `model: ${modelSelector}`,
 			thinking && `thinking: ${thinking}`,
 			timeoutMs !== undefined && `timeout: ${timeoutMs}ms`,
+			githubRead && "GitHub read enabled",
 			normalizedAllowedPaths !== undefined && `allowed paths: ${normalizedAllowedPaths.length}`,
 		].filter(Boolean).join(", ");
 		onUpdate?.({
@@ -1058,7 +1218,7 @@ async function runSubagent(
 
 		tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 		const promptFile = path.join(tmpDir, "prompt.md");
-		await fs.promises.writeFile(promptFile, getMinimalSystemPrompt(access, normalizedAllowedPaths), { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(promptFile, getMinimalSystemPrompt(access, normalizedAllowedPaths, githubRead), { encoding: "utf-8", mode: 0o600 });
 		args.push("--append-system-prompt", promptFile);
 
 		if (task.length > MAX_TASK_ARG_LENGTH) {
@@ -1076,7 +1236,12 @@ async function runSubagent(
 			stdio: ["ignore", "pipe", "pipe"],
 			detached: process.platform !== "win32",
 			windowsHide: true,
-			env: { ...process.env, PI_SUBAGENT_LITE_DISABLE: "true" },
+			env: {
+				...process.env,
+				PI_SUBAGENT_LITE_DISABLE: access === "repository-read" ? "false" : "true",
+				PI_SUBAGENT_LITE_REPOSITORY_READ: access === "repository-read" ? "true" : undefined,
+				PI_SUBAGENT_LITE_GITHUB_READ: access === "repository-read" && githubRead ? "true" : undefined,
+			},
 		});
 
 		const startedAt = Date.now();
@@ -1277,6 +1442,108 @@ async function runSubagent(
 	}
 }
 
+const RepositoryGitStatusParams = Type.Object({});
+const RepositoryGitDiffParams = Type.Object({
+	staged: Type.Optional(Type.Boolean({ description: "When true, inspect the staged diff; otherwise inspect working-tree changes." })),
+});
+const RepositoryGitShowParams = Type.Object({
+	revision: Type.Optional(Type.String({
+		description: "A simple Git ref or object ID. Defaults to HEAD; ranges, pathspecs, and flags are rejected.",
+		minLength: 1,
+		maxLength: MAX_REPOSITORY_READ_REVISION_LENGTH,
+	})),
+});
+const RepositoryGitLogParams = Type.Object({
+	limit: Type.Optional(Type.Integer({
+		description: `Maximum commit entries to return; defaults to 20 and is capped at ${MAX_REPOSITORY_READ_LOG_ENTRIES}.`,
+		minimum: 1,
+		maximum: MAX_REPOSITORY_READ_LOG_ENTRIES,
+	})),
+});
+const RepositoryGitHubItemParams = Type.Object({
+	number: Type.Integer({ description: "Issue or pull-request number in the GitHub repository associated with the current working directory.", minimum: 1 }),
+});
+
+export function registerRepositoryReadTools(pi: ExtensionAPI, enableGitHubRead = false): void {
+	pi.registerTool({
+		name: "repository_git_status",
+		label: "Repository Git Status",
+		description: "Read the current repository Git status. This runs only a fixed non-mutating Git status command; output is truncated to 2,000 lines or 50 KiB.",
+		promptSnippet: "Inspect the current repository Git status without shell access",
+		promptGuidelines: ["Use repository_git_status to inspect repository state; it accepts no command or flag arguments."],
+		parameters: RepositoryGitStatusParams,
+		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			return { content: [{ type: "text", text: await runRepositoryReadCommand("git", [...REPOSITORY_GIT_READ_CONFIG, "status", "--short", "--branch", "--untracked-files=normal"], ctx.cwd, signal) }] };
+		},
+	});
+	pi.registerTool({
+		name: "repository_git_diff",
+		label: "Repository Git Diff",
+		description: "Read a fixed non-mutating Git diff for the working tree or staging area. External diff drivers and text conversion are disabled; output is truncated to 2,000 lines or 50 KiB.",
+		promptSnippet: "Inspect a repository diff without shell access",
+		promptGuidelines: ["Use repository_git_diff for a working-tree or staged diff; it does not accept arbitrary Git options, refs, or paths."],
+		parameters: RepositoryGitDiffParams,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (params.staged !== undefined && typeof params.staged !== "boolean") throw new Error("staged must be a boolean");
+			const args = [...REPOSITORY_GIT_READ_CONFIG, "diff", "--no-ext-diff", "--no-textconv", "--no-renames"];
+			if (params.staged) args.push("--cached");
+			return { content: [{ type: "text", text: await runRepositoryReadCommand("git", args, ctx.cwd, signal) }] };
+		},
+	});
+	pi.registerTool({
+		name: "repository_git_show",
+		label: "Repository Git Show",
+		description: "Read one Git revision with its metadata, statistics, and patch. The revision is a validated simple ref/object ID, never an arbitrary Git argument; output is truncated to 2,000 lines or 50 KiB.",
+		promptSnippet: "Inspect a validated Git revision without shell access",
+		promptGuidelines: ["Use repository_git_show to inspect a single simple ref or object ID; ranges, pathspecs, and flags are rejected."],
+		parameters: RepositoryGitShowParams,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const revision = normalizeRepositoryReadRevision(params.revision);
+			const args = [...REPOSITORY_GIT_READ_CONFIG, "show", "--no-ext-diff", "--no-textconv", "--no-renames", "--format=fuller", "--stat", "--patch", revision];
+			return { content: [{ type: "text", text: await runRepositoryReadCommand("git", args, ctx.cwd, signal) }] };
+		},
+	});
+	pi.registerTool({
+		name: "repository_git_log",
+		label: "Repository Git Log",
+		description: "Read the latest Git history from HEAD. Only a validated entry limit is accepted; output is truncated to 2,000 lines or 50 KiB.",
+		promptSnippet: "Inspect recent repository history without shell access",
+		promptGuidelines: ["Use repository_git_log to inspect recent HEAD history with a bounded entry limit; it does not accept refs or arbitrary Git options."],
+		parameters: RepositoryGitLogParams,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const limit = normalizeRepositoryReadCount(params.limit);
+			return { content: [{ type: "text", text: await runRepositoryReadCommand("git", [...REPOSITORY_GIT_READ_CONFIG, "log", "--no-decorate", "--format=fuller", "--stat", `-n${limit}`], ctx.cwd, signal) }] };
+		},
+	});
+	if (!enableGitHubRead) return;
+	pi.registerTool({
+		name: "repository_github_issue_view",
+		label: "Repository GitHub Issue",
+		description: "Read one GitHub issue for the repository associated with the current working directory. Only a positive issue number is accepted; output is truncated to 2,000 lines or 50 KiB.",
+		promptSnippet: "View a GitHub issue for this repository without shell access",
+		promptGuidelines: ["Use repository_github_issue_view only to read an issue by number in the current repository; it cannot list, create, edit, close, or comment on issues."],
+		parameters: RepositoryGitHubItemParams,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const number = normalizeGitHubItemNumber(params.number, "issue number");
+			const args = ["issue", "view", String(number), "--json", "number,title,state,body,labels,author,assignees,url"];
+			return { content: [{ type: "text", text: await runRepositoryReadCommand("gh", args, ctx.cwd, signal) }] };
+		},
+	});
+	pi.registerTool({
+		name: "repository_github_pull_request_view",
+		label: "Repository GitHub Pull Request",
+		description: "Read one GitHub pull request for the repository associated with the current working directory. Only a positive pull-request number is accepted; output is truncated to 2,000 lines or 50 KiB.",
+		promptSnippet: "View a GitHub pull request for this repository without shell access",
+		promptGuidelines: ["Use repository_github_pull_request_view only to read a pull request by number in the current repository; it cannot list, create, edit, merge, or comment on pull requests."],
+		parameters: RepositoryGitHubItemParams,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const number = normalizeGitHubItemNumber(params.number, "pull request number");
+			const args = ["pr", "view", String(number), "--json", "number,title,state,body,author,assignees,baseRefName,headRefName,mergeStateStatus,statusCheckRollup,url"];
+			return { content: [{ type: "text", text: await runRepositoryReadCommand("gh", args, ctx.cwd, signal) }] };
+		},
+	});
+}
+
 const SubagentParams = Type.Object({
 	task: Type.String({ description: "Bounded delegation task. For non-trivial work, state the objective, scope, access expectations, exclusions, verification, stopping conditions, and requested report format." }),
 	model: Type.Optional(
@@ -1293,7 +1560,12 @@ const SubagentParams = Type.Object({
 	),
 	access: Type.Optional(
 		Type.Union(ACCESS_MODES.map((mode) => Type.Literal(mode)), {
-			description: "Child tool access mode. read-only enables only read, grep, find, and ls; workspace-write preserves Pi's normal tool configuration. Defaults to workspace-write for compatibility.",
+			description: "Child tool access mode. read-only enables filesystem inspection only; repository-read adds fixed structured Git operations and optional GitHub views without shell; workspace-write preserves Pi's normal tool configuration. Defaults to workspace-write for compatibility.",
+		}),
+	),
+	githubRead: Type.Optional(
+		Type.Boolean({
+			description: "Enable bounded GitHub issue and pull-request view tools for repository-read only. They inherit the child environment's gh credentials and do not expose arbitrary gh subcommands.",
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -1317,6 +1589,10 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	if (process.env.PI_SUBAGENT_LITE_REPOSITORY_READ === "true") {
+		registerRepositoryReadTools(pi, process.env.PI_SUBAGENT_LITE_GITHUB_READ === "true");
+		return;
+	}
 	if (process.env.PI_SUBAGENT_LITE_DISABLE === "true") {
 		return;
 	}
@@ -1340,13 +1616,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise report when its work is done. A successful tool result is provisional: it is not proof that tests passed or that the parent should accept the work. Optional allowedPaths contracts report bounded Git-observed net changes and out-of-scope paths without sandboxing or rolling back writes. Select read-only or workspace-write access and an optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise report when its work is done. A successful tool result is provisional: it is not proof that tests passed or that the parent should accept the work. repository-read adds fixed Git read operations and optional GitHub issue/pull-request views without arbitrary shell access; it is a tool boundary, not an OS sandbox. Optional allowedPaths contracts report bounded Git-observed net changes and out-of-scope paths without sandboxing or rolling back writes. Select an access mode and optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
 		promptSnippet: "Delegate a bounded task and receive a provisional report",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
 			"For non-trivial delegation, state the objective, scope, access expectations, exclusions, verification, stopping conditions, and desired report format in the task.",
 			"Treat every successful subagent result as a provisional report, not proof that tests passed or that the task is accepted. Review the reported evidence, unresolved blockers, uncertainty, and workspace state before deciding next steps.",
 			"Parallelize read-only work freely, but run at most one workspace-write subagent per working directory at a time; a concurrent same-directory writer is rejected rather than queued.",
+			"repository-read exposes only fixed structured Git operations plus optional GitHub issue/pull-request views. It does not expose a shell or arbitrary command arguments, but it is a tool boundary rather than an operating-system sandbox and inherits ordinary child environment/credential visibility.",
 			"For workspace-write tasks, allowedPaths can report Git-observed net changes against cwd-relative patterns. It is observational only: it does not sandbox, stop, or roll back a violating child, and unavailable Git observation must be treated as unknown scope.",
 			"Before selecting a subagent model in a fresh session, use subagent_models. Select from its live catalog based on the task's concrete needs; do not guess selectors or assume the parent model is available to the child.",
 		],
@@ -1363,6 +1640,7 @@ export default function (pi: ExtensionAPI) {
 				params.thinking,
 				params.timeoutMs,
 				params.allowedPaths,
+				params.githubRead,
 				signal,
 				onUpdate,
 			);
@@ -1382,6 +1660,7 @@ export default function (pi: ExtensionAPI) {
 			if (model) text += ` ${theme.fg("accent", `[${model}]`)}`;
 			if (args.thinking) text += ` ${theme.fg("accent", `[thinking: ${args.thinking}]`)}`;
 			if (args.timeoutMs !== undefined) text += ` ${theme.fg("accent", `[timeout: ${args.timeoutMs}ms]`)}`;
+			if (args.githubRead) text += ` ${theme.fg("accent", "[GitHub read]")}`;
 			if (args.allowedPaths !== undefined) text += ` ${theme.fg("accent", `[allowed paths: ${args.allowedPaths.length}]`)}`;
 			const skillsArr = args.skills ?? [];
 			if (skillsArr.length > 0) {
