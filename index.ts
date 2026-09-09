@@ -6,6 +6,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -25,6 +26,14 @@ const TASKKILL_GRACE_MS = 2_000;
 const MAX_DIAGNOSTIC_DETAIL_LENGTH = 240;
 const MAX_PROTOCOL_BUFFER_LENGTH = 1_000_000;
 const MAX_STDERR_TAIL_LENGTH = 4_000;
+const MAX_ALLOWED_PATHS = 100;
+const MAX_ALLOWED_PATH_LENGTH = 512;
+const MAX_GIT_OUTPUT_BYTES = 4_000_000;
+const MAX_WORKSPACE_SNAPSHOT_PATHS = 10_000;
+const MAX_WORKSPACE_FILE_BYTES = 16_000_000;
+const MAX_WORKSPACE_SNAPSHOT_BYTES = 64_000_000;
+const MAX_WORKSPACE_SNAPSHOT_DURATION_MS = 10_000;
+const GIT_OBSERVATION_TIMEOUT_MS = 10_000;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 const ACCESS_MODES = ["read-only", "workspace-write"] as const;
@@ -60,15 +69,377 @@ function acquireWorkspaceWriteLease(cwd: string): () => void {
 	};
 }
 
-function getMinimalSystemPrompt(access: AccessMode): string {
+type GitWorkspace = {
+	root: string;
+	cwd: string;
+	cwdPrefix: string;
+};
+type WorkspaceFileState = {
+	index: string;
+	file: string;
+};
+type WorkspaceFingerprint = {
+	file: string;
+	bytesRead: number;
+	limitation?: string;
+};
+type GitWorkspaceSnapshot = {
+	workspace: GitWorkspace;
+	files: Map<string, WorkspaceFileState>;
+	limitations: string[];
+};
+type WorkspaceChangeStatus = "available" | "partial" | "unavailable";
+type WorkspaceChangeReport = {
+	schemaVersion: 1;
+	source: "git";
+	status: WorkspaceChangeStatus;
+	relativeTo: "cwd";
+	allowedPaths: string[];
+	changedPaths: string[];
+	outsideAllowedPaths: string[];
+	contractStatus: "within-observed-scope" | "violated" | "unknown";
+	diagnostics: string[];
+};
+type WorkspaceObservation = {
+	allowedPaths: string[];
+	baseline?: GitWorkspaceSnapshot;
+	initialDiagnostic?: string;
+};
+type SubagentRunResult = {
+	output: string;
+	workspaceChanges?: WorkspaceChangeReport;
+};
+
+function normalizeAllowedPaths(allowedPaths: string[] | undefined): string[] | undefined {
+	if (allowedPaths === undefined) return undefined;
+	if (!Array.isArray(allowedPaths)) throw new Error("allowedPaths must be an array of cwd-relative path patterns");
+	if (allowedPaths.length > MAX_ALLOWED_PATHS) throw new Error(`allowedPaths may contain at most ${MAX_ALLOWED_PATHS} entries`);
+
+	const normalized = new Set<string>();
+	for (const rawPath of allowedPaths) {
+		if (typeof rawPath !== "string") throw new Error("allowedPaths must contain only strings");
+		if (rawPath.length === 0 || rawPath.length > MAX_ALLOWED_PATH_LENGTH) {
+			throw new Error(`Each allowedPaths entry must be between 1 and ${MAX_ALLOWED_PATH_LENGTH} characters`);
+		}
+		if (rawPath.includes("\0") || path.isAbsolute(rawPath) || /^(?:[A-Za-z]:|\\\\|\/\/)/.test(rawPath)) {
+			throw new Error(`allowedPaths entry ${JSON.stringify(rawPath)} must be a cwd-relative path pattern`);
+		}
+		const candidate = rawPath.replace(/\\/g, "/");
+		const segments = candidate.split("/");
+		if (segments.some((segment) => !segment || segment === "." || segment === ".." || (segment.includes("**") && segment !== "**"))) {
+			throw new Error(`allowedPaths entry ${JSON.stringify(rawPath)} must not contain empty, dot, dot-dot, or partial ** segments`);
+		}
+		normalized.add(segments.join("/"));
+	}
+	return [...normalized].sort((a, b) => a.localeCompare(b));
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function toGitPath(relativePath: string): string {
+	return relativePath.split(path.sep).join("/");
+}
+
+function isGitPathWithinCwd(repoPath: string, cwdPrefix: string): boolean {
+	return cwdPrefix === "" || repoPath === cwdPrefix || repoPath.startsWith(`${cwdPrefix}/`);
+}
+
+function relativeToCwd(repoPath: string, cwdPrefix: string): string {
+	return cwdPrefix === "" ? repoPath : repoPath.slice(cwdPrefix.length + 1);
+}
+
+function parseNulDelimited(output: Buffer): string[] {
+	return output.toString("utf8").split("\0").filter((entry) => entry.length > 0);
+}
+
+async function runGit(cwd: string, args: string[]): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let stdoutSize = 0;
+		let stderr = "";
+		let timeout: NodeJS.Timeout | undefined;
+		const stdout: Buffer[] = [];
+		const finish = (error?: Error, output?: Buffer) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			if (error) reject(error);
+			else resolve(output ?? Buffer.alloc(0));
+		};
+		let proc: ChildProcess;
+		try {
+			proc = spawn("git", args, {
+				cwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+				env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat", GIT_TERMINAL_PROMPT: "0" },
+			});
+		} catch (error) {
+			finish(new Error(`Git observation could not start: ${diagnosticDetail(error)}`));
+			return;
+		}
+		timeout = setTimeout(() => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				/* best effort */
+			}
+			finish(new Error(`Git observation timed out after ${GIT_OBSERVATION_TIMEOUT_MS}ms`));
+		}, GIT_OBSERVATION_TIMEOUT_MS);
+		timeout.unref();
+		proc.stdout?.on("data", (chunk: Buffer) => {
+			stdoutSize += chunk.length;
+			if (stdoutSize > MAX_GIT_OUTPUT_BYTES) {
+				try {
+					proc.kill("SIGKILL");
+				} catch {
+					/* best effort */
+				}
+				finish(new Error(`Git observation exceeded ${MAX_GIT_OUTPUT_BYTES} output bytes`));
+				return;
+			}
+			stdout.push(chunk);
+		});
+		proc.stderr?.on("data", (chunk: Buffer) => {
+			stderr = appendBoundedTail(stderr, chunk.toString("utf8"), MAX_DIAGNOSTIC_DETAIL_LENGTH);
+		});
+		proc.once("error", (error) => finish(new Error(`Git observation could not start: ${diagnosticDetail(error)}`)));
+		proc.once("close", (code) => {
+			if (code === 0) finish(undefined, Buffer.concat(stdout));
+			else finish(new Error(`Git observation failed${code === null ? "" : ` with code ${code}`}${stderr.trim() ? `: ${diagnosticDetail(stderr)}` : ""}`));
+		});
+	});
+}
+
+async function getGitWorkspace(cwd: string): Promise<GitWorkspace> {
+	const rootOutput = await runGit(cwd, ["rev-parse", "--show-toplevel"]);
+	const root = await fs.promises.realpath(rootOutput.toString("utf8").trim());
+	const resolvedCwd = await fs.promises.realpath(cwd);
+	if (!isPathWithin(root, resolvedCwd)) throw new Error("Git worktree does not contain the requested working directory");
+	return { root, cwd: resolvedCwd, cwdPrefix: toGitPath(path.relative(root, resolvedCwd)) };
+}
+
+function parseIndexEntries(output: Buffer): Map<string, string> {
+	const entries = new Map<string, string[]>();
+	for (const record of parseNulDelimited(output)) {
+		const separator = record.indexOf("\t");
+		if (separator === -1) throw new Error("Git index observation returned an unparseable entry");
+		const metadata = record.slice(0, separator);
+		const repoPath = record.slice(separator + 1);
+		const pathEntries = entries.get(repoPath) ?? [];
+		pathEntries.push(metadata);
+		entries.set(repoPath, pathEntries);
+	}
+	return new Map([...entries].map(([repoPath, values]) => [repoPath, values.sort().join("|")]));
+}
+
+async function fingerprintWorkspacePath(workspace: GitWorkspace, repoPath: string, remainingBytes: number): Promise<WorkspaceFingerprint> {
+	const absolutePath = path.resolve(workspace.root, ...repoPath.split("/"));
+	if (!isPathWithin(workspace.root, absolutePath) || !isPathWithin(workspace.cwd, absolutePath)) {
+		throw new Error(`Git observation returned a path outside the working directory: ${JSON.stringify(repoPath)}`);
+	}
+	try {
+		const resolvedParent = await fs.promises.realpath(path.dirname(absolutePath));
+		if (!isPathWithin(workspace.root, resolvedParent) || !isPathWithin(workspace.cwd, resolvedParent)) {
+			throw new Error(`Git observation would traverse a symlink outside the working directory: ${JSON.stringify(repoPath)}`);
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { file: "missing", bytesRead: 0 };
+		throw error;
+	}
+	let stats: fs.Stats;
+	try {
+		stats = await fs.promises.lstat(absolutePath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { file: "missing", bytesRead: 0 };
+		throw error;
+	}
+	const mode = stats.mode & 0o777;
+	if (stats.isSymbolicLink()) {
+		return { file: `symlink:${mode}:${createHash("sha256").update(await fs.promises.readlink(absolutePath)).digest("hex")}`, bytesRead: 0 };
+	}
+	if (stats.isDirectory()) {
+		return { file: `directory:${mode}`, bytesRead: 0, limitation: `Contents of directory entry ${JSON.stringify(repoPath)} are not observed` };
+	}
+	if (!stats.isFile()) {
+		return { file: `other:${mode}`, bytesRead: 0, limitation: `Unsupported filesystem entry ${JSON.stringify(repoPath)} is not observed` };
+	}
+	if (stats.size > MAX_WORKSPACE_FILE_BYTES) throw new Error(`Git observation cannot fingerprint ${JSON.stringify(repoPath)} because it exceeds ${MAX_WORKSPACE_FILE_BYTES} bytes`);
+	if (stats.size > remainingBytes) throw new Error(`Git observation exceeded the ${MAX_WORKSPACE_SNAPSHOT_BYTES}-byte aggregate fingerprint limit`);
+	return {
+		file: `file:${mode}:${stats.size}:${createHash("sha256").update(await fs.promises.readFile(absolutePath)).digest("hex")}`,
+		bytesRead: stats.size,
+	};
+}
+
+async function captureGitWorkspaceSnapshot(cwd: string, existingWorkspace?: GitWorkspace): Promise<GitWorkspaceSnapshot> {
+	const deadline = Date.now() + MAX_WORKSPACE_SNAPSHOT_DURATION_MS;
+	const workspace = existingWorkspace ?? await getGitWorkspace(cwd);
+	const [trackedOutput, indexOutput, untrackedOutput] = await Promise.all([
+		runGit(workspace.root, ["ls-files", "-z"]),
+		runGit(workspace.root, ["ls-files", "-s", "-z"]),
+		runGit(workspace.root, ["ls-files", "--others", "--exclude-standard", "-z"]),
+	]);
+	if (Date.now() > deadline) throw new Error(`Git observation exceeded the ${MAX_WORKSPACE_SNAPSHOT_DURATION_MS}ms snapshot deadline`);
+	const indexEntries = parseIndexEntries(indexOutput);
+	const candidates = new Set([...parseNulDelimited(trackedOutput), ...indexEntries.keys(), ...parseNulDelimited(untrackedOutput)]);
+	const repoPaths = [...candidates].filter((repoPath) => isGitPathWithinCwd(repoPath, workspace.cwdPrefix)).sort((a, b) => a.localeCompare(b));
+	if (repoPaths.length > MAX_WORKSPACE_SNAPSHOT_PATHS) throw new Error(`Git observation found more than ${MAX_WORKSPACE_SNAPSHOT_PATHS} paths under the working directory`);
+
+	const files = new Map<string, WorkspaceFileState>();
+	const limitations: string[] = [];
+	let remainingBytes = MAX_WORKSPACE_SNAPSHOT_BYTES;
+	for (const repoPath of repoPaths) {
+		if (Date.now() > deadline) throw new Error(`Git observation exceeded the ${MAX_WORKSPACE_SNAPSHOT_DURATION_MS}ms snapshot deadline`);
+		const relativePath = relativeToCwd(repoPath, workspace.cwdPrefix);
+		const fingerprint = await fingerprintWorkspacePath(workspace, repoPath, remainingBytes);
+		if (Date.now() > deadline) throw new Error(`Git observation exceeded the ${MAX_WORKSPACE_SNAPSHOT_DURATION_MS}ms snapshot deadline`);
+		remainingBytes -= fingerprint.bytesRead;
+		if (fingerprint.limitation) limitations.push(fingerprint.limitation);
+		files.set(relativePath, {
+			index: indexEntries.get(repoPath) ?? "",
+			file: fingerprint.file,
+		});
+	}
+	return { workspace, files, limitations };
+}
+
+async function beginWorkspaceObservation(cwd: string, allowedPaths: string[]): Promise<WorkspaceObservation> {
+	try {
+		return { allowedPaths, baseline: await captureGitWorkspaceSnapshot(cwd) };
+	} catch (error) {
+		return { allowedPaths, initialDiagnostic: `Workspace observation unavailable: ${diagnosticDetail(error)}` };
+	}
+}
+
+function matchesAllowedPath(pathToMatch: string, pattern: string): boolean {
+	const pathSegments = pathToMatch.split("/");
+	const patternSegments = pattern.split("/");
+	const matchesSegment = (value: string, segment: string) => {
+		const valueCharacters = [...value];
+		const patternCharacters = [...segment];
+		const memo = new Map<string, boolean>();
+		const matches = (valueIndex: number, patternIndex: number): boolean => {
+			const key = `${valueIndex}:${patternIndex}`;
+			const cached = memo.get(key);
+			if (cached !== undefined) return cached;
+			let result: boolean;
+			if (patternIndex === patternCharacters.length) {
+				result = valueIndex === valueCharacters.length;
+			} else if (patternCharacters[patternIndex] === "*") {
+				result = matches(valueIndex, patternIndex + 1) || (valueIndex < valueCharacters.length && matches(valueIndex + 1, patternIndex));
+			} else {
+				result = valueIndex < valueCharacters.length
+					&& (patternCharacters[patternIndex] === "?" || patternCharacters[patternIndex] === valueCharacters[valueIndex])
+					&& matches(valueIndex + 1, patternIndex + 1);
+			}
+			memo.set(key, result);
+			return result;
+		};
+		return matches(0, 0);
+	};
+	const memo = new Map<string, boolean>();
+	const matches = (pathIndex: number, patternIndex: number): boolean => {
+		const key = `${pathIndex}:${patternIndex}`;
+		const cached = memo.get(key);
+		if (cached !== undefined) return cached;
+		let result: boolean;
+		if (patternIndex === patternSegments.length) {
+			result = pathIndex === pathSegments.length;
+		} else {
+			const segment = patternSegments[patternIndex];
+			if (segment === "**") {
+				result = patternIndex === patternSegments.length - 1;
+				for (let index = pathIndex; !result && index <= pathSegments.length; index++) {
+					result = matches(index, patternIndex + 1);
+				}
+			} else {
+				result = pathIndex < pathSegments.length && matchesSegment(pathSegments[pathIndex], segment) && matches(pathIndex + 1, patternIndex + 1);
+			}
+		}
+		memo.set(key, result);
+		return result;
+	};
+	return matches(0, 0);
+}
+
+async function captureWorkspaceChangeReport(observation: WorkspaceObservation): Promise<WorkspaceChangeReport> {
+	if (!observation.baseline) {
+		return {
+			schemaVersion: 1, source: "git", status: "unavailable", relativeTo: "cwd", allowedPaths: observation.allowedPaths,
+			changedPaths: [], outsideAllowedPaths: [], contractStatus: "unknown", diagnostics: [observation.initialDiagnostic ?? "Workspace observation did not start"],
+		};
+	}
+	let after: GitWorkspaceSnapshot;
+	try {
+		after = await captureGitWorkspaceSnapshot(observation.baseline.workspace.cwd, observation.baseline.workspace);
+	} catch (error) {
+		return {
+			schemaVersion: 1, source: "git", status: "partial", relativeTo: "cwd", allowedPaths: observation.allowedPaths,
+			changedPaths: [], outsideAllowedPaths: [], contractStatus: "unknown", diagnostics: [`Workspace observation incomplete: ${diagnosticDetail(error)}`],
+		};
+	}
+	const paths = new Set([...observation.baseline.files.keys(), ...after.files.keys()]);
+	const changedPaths = [...paths].filter((relativePath) => {
+		const before = observation.baseline?.files.get(relativePath);
+		const current = after.files.get(relativePath);
+		return before?.index !== current?.index || before?.file !== current?.file;
+	}).sort((a, b) => a.localeCompare(b));
+	const outsideAllowedPaths = changedPaths.filter((relativePath) => !observation.allowedPaths.some((pattern) => matchesAllowedPath(relativePath, pattern)));
+	const diagnostics = [...new Set([...observation.baseline.limitations, ...after.limitations])];
+	const status: WorkspaceChangeStatus = diagnostics.length > 0 ? "partial" : "available";
+	return {
+		schemaVersion: 1,
+		source: "git",
+		status,
+		relativeTo: "cwd",
+		allowedPaths: observation.allowedPaths,
+		changedPaths,
+		outsideAllowedPaths,
+		contractStatus: status === "partial" ? "unknown" : outsideAllowedPaths.length > 0 ? "violated" : "within-observed-scope",
+		diagnostics,
+	};
+}
+
+function formatWorkspaceChangeReport(report: WorkspaceChangeReport): string {
+	const formatPaths = (paths: string[]) => paths.length === 0 ? "none" : paths.map((value) => JSON.stringify(value)).join(", ");
+	const lines = [
+		"Workspace change report (observational):",
+		`- status: ${report.status}`,
+		`- contract: ${report.contractStatus}`,
+		`- allowed paths: ${formatPaths(report.allowedPaths)}`,
+		`- observed changed paths: ${formatPaths(report.changedPaths)}`,
+		`- outside allowed paths: ${formatPaths(report.outsideAllowedPaths)}`,
+	];
+	for (const diagnostic of report.diagnostics) lines.push(`- diagnostic: ${diagnostic}`);
+	return lines.join("\n");
+}
+
+function appendWorkspaceChangeReport(output: string, report: WorkspaceChangeReport | undefined): string {
+	return report ? `${output || "(no output)"}\n\n${formatWorkspaceChangeReport(report)}` : output;
+}
+
+function appendWorkspaceChangeReportToError(error: unknown, report: WorkspaceChangeReport | undefined): Error {
+	if (!report) return error instanceof Error ? error : new Error(String(error));
+	const message = error instanceof Error ? error.message : String(error);
+	return new Error(`${message}\n\n${formatWorkspaceChangeReport(report)}`);
+}
+
+function getMinimalSystemPrompt(access: AccessMode, allowedPaths?: string[]): string {
 	const accessGuidance = access === "read-only"
 		? "You are in read-only access mode. Use only the available non-mutating tools and do not modify the workspace."
 		: "You are in workspace-write access mode. You may use the available tools to inspect and modify the workspace as the task requires.";
+	const contractGuidance = allowedPaths
+		? `\nAn observational allowed-path contract applies: ${allowedPaths.map((value) => JSON.stringify(value)).join(", ") || "no changes are allowed"}. Keep edits within that contract. The parent reports net observed Git changes after the run; this is not a sandbox and does not undo edits.\n`
+		: "";
 
 	return `You are a subagent running in an isolated pi process.
 
-${accessGuidance}
-
+${accessGuidance}${contractGuidance}
 Your job is to focus exclusively on the assigned task, use tools as needed, and provide a concise, evidence-based final report.
 
 Guidelines:
@@ -628,11 +999,16 @@ async function runSubagent(
 	model?: string,
 	thinking?: ThinkingLevel,
 	timeoutMs?: number,
+	allowedPaths?: string[],
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult) => void,
-): Promise<string> {
+): Promise<SubagentRunResult> {
 	if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < MIN_SUBAGENT_TIMEOUT_MS || timeoutMs > MAX_SUBAGENT_TIMEOUT_MS)) {
 		throw new Error(`timeoutMs must be an integer between ${MIN_SUBAGENT_TIMEOUT_MS} and ${MAX_SUBAGENT_TIMEOUT_MS}`);
+	}
+	const normalizedAllowedPaths = normalizeAllowedPaths(allowedPaths);
+	if (normalizedAllowedPaths !== undefined && access !== "workspace-write") {
+		throw new Error("allowedPaths is only supported with access: \"workspace-write\"");
 	}
 	if (signal?.aborted) throw new Error("Subagent aborted by caller");
 
@@ -659,13 +1035,22 @@ async function runSubagent(
 		? acquireWorkspaceWriteLease(cwd)
 		: undefined;
 	let tmpDir: string | null = null;
+	let workspaceObservation: WorkspaceObservation | undefined;
+	let workspaceChanges: WorkspaceChangeReport | undefined;
+	const finishWorkspaceObservation = async (): Promise<WorkspaceChangeReport | undefined> => {
+		if (!workspaceObservation || workspaceChanges) return workspaceChanges;
+		workspaceChanges = await captureWorkspaceChangeReport(workspaceObservation);
+		return workspaceChanges;
+	};
 
 	try {
+		if (normalizedAllowedPaths !== undefined) workspaceObservation = await beginWorkspaceObservation(cwd, normalizedAllowedPaths);
 		const selection = [
 			`access: ${access}`,
 			modelSelector && `model: ${modelSelector}`,
 			thinking && `thinking: ${thinking}`,
 			timeoutMs !== undefined && `timeout: ${timeoutMs}ms`,
+			normalizedAllowedPaths !== undefined && `allowed paths: ${normalizedAllowedPaths.length}`,
 		].filter(Boolean).join(", ");
 		onUpdate?.({
 			content: [{ type: "text", text: `Subagent running (${selection})...` }],
@@ -673,7 +1058,7 @@ async function runSubagent(
 
 		tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 		const promptFile = path.join(tmpDir, "prompt.md");
-		await fs.promises.writeFile(promptFile, getMinimalSystemPrompt(access), { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(promptFile, getMinimalSystemPrompt(access, normalizedAllowedPaths), { encoding: "utf-8", mode: 0o600 });
 		args.push("--append-system-prompt", promptFile);
 
 		if (task.length > MAX_TASK_ARG_LENGTH) {
@@ -876,7 +1261,11 @@ async function runSubagent(
 			: protocolFailure ?? signalFailure ?? (lastAssistantError ? new Error(lastAssistantError) : undefined);
 		if (failure) throw new SubagentRecoveryError(diagnosticDetail(failure), buildRecoveryDiagnostics("abnormal-exit"));
 
-		return lastAssistantText;
+		const report = await finishWorkspaceObservation();
+		return { output: appendWorkspaceChangeReport(lastAssistantText, report), workspaceChanges: report };
+	} catch (error) {
+		const report = await finishWorkspaceObservation();
+		throw appendWorkspaceChangeReportToError(error, report);
 	} finally {
 		try {
 			if (tmpDir) await fs.promises.rm(tmpDir, { recursive: true, force: true });
@@ -914,6 +1303,12 @@ const SubagentParams = Type.Object({
 			maximum: MAX_SUBAGENT_TIMEOUT_MS,
 		}),
 	),
+	allowedPaths: Type.Optional(
+		Type.Array(Type.String({ minLength: 1, maxLength: MAX_ALLOWED_PATH_LENGTH }), {
+			description: "Optional cwd-relative path patterns for a workspace-write observational contract. Net Git changes are reported after success or failure; this is not an OS sandbox.",
+			maxItems: MAX_ALLOWED_PATHS,
+		}),
+	),
 	skills: Type.Optional(
 		Type.Array(Type.String({ description: "Skill path or name to load via --skill" }), {
 			description: "Optional startup skills to load into the subagent process",
@@ -945,13 +1340,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise report when its work is done. A successful tool result is provisional: it is not proof that tests passed or that the parent should accept the work. Select read-only or workspace-write access and an optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise report when its work is done. A successful tool result is provisional: it is not proof that tests passed or that the parent should accept the work. Optional allowedPaths contracts report bounded Git-observed net changes and out-of-scope paths without sandboxing or rolling back writes. Select read-only or workspace-write access and an optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
 		promptSnippet: "Delegate a bounded task and receive a provisional report",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
 			"For non-trivial delegation, state the objective, scope, access expectations, exclusions, verification, stopping conditions, and desired report format in the task.",
 			"Treat every successful subagent result as a provisional report, not proof that tests passed or that the task is accepted. Review the reported evidence, unresolved blockers, uncertainty, and workspace state before deciding next steps.",
 			"Parallelize read-only work freely, but run at most one workspace-write subagent per working directory at a time; a concurrent same-directory writer is rejected rather than queued.",
+			"For workspace-write tasks, allowedPaths can report Git-observed net changes against cwd-relative patterns. It is observational only: it does not sandbox, stop, or roll back a violating child, and unavailable Git observation must be treated as unknown scope.",
 			"Before selecting a subagent model in a fresh session, use subagent_models. Select from its live catalog based on the task's concrete needs; do not guess selectors or assume the parent model is available to the child.",
 		],
 		parameters: SubagentParams,
@@ -966,11 +1362,13 @@ export default function (pi: ExtensionAPI) {
 				params.model,
 				params.thinking,
 				params.timeoutMs,
+				params.allowedPaths,
 				signal,
 				onUpdate,
 			);
 			return {
-				content: [{ type: "text", text: output || "(no output)" }],
+				content: [{ type: "text", text: output.output || "(no output)" }],
+				details: output.workspaceChanges ? { workspaceChanges: output.workspaceChanges } : undefined,
 			};
 		},
 
@@ -984,6 +1382,7 @@ export default function (pi: ExtensionAPI) {
 			if (model) text += ` ${theme.fg("accent", `[${model}]`)}`;
 			if (args.thinking) text += ` ${theme.fg("accent", `[thinking: ${args.thinking}]`)}`;
 			if (args.timeoutMs !== undefined) text += ` ${theme.fg("accent", `[timeout: ${args.timeoutMs}ms]`)}`;
+			if (args.allowedPaths !== undefined) text += ` ${theme.fg("accent", `[allowed paths: ${args.allowedPaths.length}]`)}`;
 			const skillsArr = args.skills ?? [];
 			if (skillsArr.length > 0) {
 				text += ` ${theme.fg("accent", `+${skillsArr.length} skills`)}`;

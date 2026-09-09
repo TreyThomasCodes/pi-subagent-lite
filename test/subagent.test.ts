@@ -1,24 +1,26 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { stripVTControlCharacters } from "node:util";
+import { promisify, stripVTControlCharacters } from "node:util";
 import type { AgentToolResult, ExtensionAPI, ToolRenderContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import registerSubagent from "../index.js";
 
 type SubagentTool = Parameters<ExtensionAPI["registerTool"]>[0];
-type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; skills?: string[] };
+type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; allowedPaths?: string[]; skills?: string[] };
+const execFileAsync = promisify(execFile);
 type Invocation = { args: string[]; cwd: string; disabled: string; prompt: string; task: string; thinking?: string; tools?: string };
 
 // Exercise the real spawn/argument/parsing path without invoking Pi or a paid model.
 const FAKE_PI = String.raw`
 const fs = require("node:fs");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const modelIndex = args.indexOf("--model");
 const model = modelIndex === -1 ? undefined : args[modelIndex + 1];
@@ -131,6 +133,26 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
       stopReason: model === "_fixture_aborted_" ? "aborted" : "error",
       errorMessage: model === "_fixture_empty_error_" ? undefined : "Provider rejected the request",
     });
+  } else if (model === "_fixture_scope_inside_") {
+    fs.mkdirSync("allowed/nested", { recursive: true });
+    fs.writeFileSync("allowed/nested/in-scope.ts", "export const inside = true;\\n");
+    emit({ role: "assistant", content: [{ type: "text", text: "Wrote an in-scope file" }], stopReason: "stop" });
+  } else if (model === "_fixture_scope_mixed_") {
+    fs.mkdirSync("allowed", { recursive: true });
+    fs.writeFileSync("allowed/in-scope.ts", "export const inside = true;\\n");
+    fs.writeFileSync("outside.txt", "outside contract\\n");
+    emit({ role: "assistant", content: [{ type: "text", text: "Wrote mixed-scope files" }], stopReason: "stop" });
+  } else if (model === "_fixture_scope_dirty_") {
+    fs.appendFileSync("tracked.ts", "export const after = true;\\n");
+    emit({ role: "assistant", content: [{ type: "text", text: "Modified a pre-existing dirty file" }], stopReason: "stop" });
+  } else if (model === "_fixture_scope_rename_") {
+    fs.renameSync("allowed/original.txt", "allowed/renamed.txt");
+    emit({ role: "assistant", content: [{ type: "text", text: "Renamed an in-scope file" }], stopReason: "stop" });
+  } else if (model === "_fixture_scope_stage_") {
+    fs.writeFileSync("tracked.ts", "export const staged = true;\\n");
+    const staged = spawnSync("git", ["add", "tracked.ts"]);
+    if (staged.status !== 0) throw new Error("Could not stage fixture change");
+    emit({ role: "assistant", content: [{ type: "text", text: "Staged a tracked file" }], stopReason: "stop" });
   } else {
     if (model === "_fixture_recovered_") {
       emit({ role: "assistant", content: [], stopReason: "error", errorMessage: "Transient provider failure" });
@@ -189,7 +211,12 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 
 	const fixtureScript = join(fixtureDir, "fake-pi.cjs");
 	const otherCwd = join(fixtureDir, "other-workspace");
-	await Promise.all([writeFile(fixtureScript, FAKE_PI), mkdir(otherCwd)]);
+	const contractWorkspace = join(fixtureDir, "workspace-contract");
+	await Promise.all([writeFile(fixtureScript, FAKE_PI), mkdir(otherCwd), mkdir(contractWorkspace)]);
+	await writeFile(join(contractWorkspace, "tracked.ts"), "export const baseline = true;\n");
+	await execFileAsync("git", ["init", "--quiet"], { cwd: contractWorkspace });
+	await execFileAsync("git", ["add", "tracked.ts"], { cwd: contractWorkspace });
+	await execFileAsync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture baseline"], { cwd: contractWorkspace });
 	// This file's tests run serially in their own test-runner process. Point the
 	// normal getPiInvocation path at the fixture and restore it in the hook above.
 	process.argv[1] = fixtureScript;
@@ -205,6 +232,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	assert.ok(modelsTool);
 	const parentModel = Object.freeze({ provider: "parent-provider", id: "parent-model" });
 	const ctx = Object.freeze({ cwd: fixtureDir, hasUI: false, model: parentModel });
+	const contractCtx = Object.freeze({ cwd: contractWorkspace, hasUI: false, model: parentModel });
 	const task = "Find all test files";
 	const isProcessRunning = (pid: number) => {
 		try {
@@ -278,7 +306,9 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		const guidelines = tool.promptGuidelines?.join(" ") ?? "";
 		assert.match(tool.description, /successful tool result is provisional.*not proof that tests passed.*accept/i);
 		assert.match(tool.promptSnippet ?? "", /bounded task.*provisional report/i);
+		assert.match(tool.description, /allowedPaths.*Git-observed.*without sandboxing/i);
 		assert.match(guidelines, /objective.*scope.*access expectations.*exclusions.*verification.*stopping conditions.*report format/i);
+		assert.match(guidelines, /allowedPaths.*observational.*unknown scope/i);
 		assert.match(guidelines, /successful subagent result.*provisional report.*not proof.*tests passed.*accepted/i);
 	});
 
@@ -329,6 +359,13 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(existsSync(dirname(promptFile)), false, "temporary prompts are cleaned up");
 		return invocation;
 	};
+	const getWorkspaceChanges = (result: AgentToolResult) => {
+		const changes = (result.details as { workspaceChanges?: {
+			status: string; contractStatus: string; changedPaths: string[]; outsideAllowedPaths: string[];
+		} } | undefined)?.workspaceChanges;
+		assert.ok(changes, "allowedPaths results include structured workspace changes");
+		return changes;
+	};
 
 	await t.test("schema makes optional selections strict", () => {
 		const schema = tool.parameters as TSchema;
@@ -344,12 +381,160 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(Value.Check(schema, { task, access: "write" }), false);
 		assert.equal(Value.Check(schema, { task, timeoutMs: 1_000 }), true);
 		assert.equal(Value.Check(schema, { task, timeoutMs: 86_400_000 }), true);
+		assert.equal(Value.Check(schema, { task, allowedPaths: ["src/**", "README.md"] }), true);
+		assert.equal(Value.Check(schema, { task, allowedPaths: [] }), true);
+		assert.equal(Value.Check(schema, { task, allowedPaths: [""] }), false);
+		assert.equal(Value.Check(schema, { task, allowedPaths: "src/**" }), false);
 		for (const timeoutMs of [999, 86_400_001, 1_000.5, "1000", null]) {
 			assert.equal(Value.Check(schema, { task, timeoutMs }), false, `invalid timeout: ${JSON.stringify(timeoutMs)}`);
 		}
 		for (const model of ["", " \t\n", 42, null, [], {}]) {
 			assert.equal(Value.Check(schema, { task, model }), false, `invalid model: ${JSON.stringify(model)}`);
 		}
+	});
+
+	await t.test("observes in-scope and out-of-scope net workspace changes", async () => {
+		await Promise.all([
+			rm(join(contractWorkspace, "allowed"), { recursive: true, force: true }),
+			rm(join(contractWorkspace, "outside.txt"), { force: true }),
+		]);
+		const result = await tool.execute(
+			"scope-mixed-test",
+			{ task, model: "_fixture_scope_mixed_", allowedPaths: ["allowed/**"] },
+			undefined,
+			undefined,
+			contractCtx,
+		);
+		const changes = getWorkspaceChanges(result);
+		assert.equal(changes.status, "available");
+		assert.equal(changes.contractStatus, "violated");
+		assert.deepEqual(changes.changedPaths, ["allowed/in-scope.ts", "outside.txt"]);
+		assert.deepEqual(changes.outsideAllowedPaths, ["outside.txt"]);
+		assert.match(result.content[0].text, /Workspace change report \(observational\):[\s\S]*contract: violated/);
+		await Promise.all([
+			rm(join(contractWorkspace, "allowed"), { recursive: true, force: true }),
+			rm(join(contractWorkspace, "outside.txt"), { force: true }),
+		]);
+	});
+
+	await t.test("passes an allowed-path contract to the child and reports a clean net diff", async () => {
+		const result = await tool.execute(
+			"scope-prompt-test",
+			{ task, allowedPaths: ["src/**"] },
+			undefined,
+			undefined,
+			contractCtx,
+		);
+		const [invocationText] = result.content[0].text.split("\n\nWorkspace change report");
+		const invocation = JSON.parse(invocationText) as Invocation;
+		assert.match(invocation.prompt, /observational allowed-path contract applies: "src\/\*\*"/);
+		assert.deepEqual(getWorkspaceChanges(result).changedPaths, []);
+	});
+
+	await t.test("scopes Git observation to a nested working directory", async () => {
+		const nestedCwd = join(contractWorkspace, "nested-cwd");
+		await mkdir(nestedCwd);
+		const result = await tool.execute(
+			"nested-contract",
+			{ task, model: "_fixture_scope_inside_", allowedPaths: ["allowed/**"] },
+			undefined,
+			undefined,
+			{ ...contractCtx, cwd: nestedCwd },
+		);
+		const changes = getWorkspaceChanges(result);
+		assert.equal(changes.contractStatus, "within-observed-scope");
+		assert.deepEqual(changes.changedPaths, ["allowed/nested/in-scope.ts"]);
+		await rm(nestedCwd, { recursive: true, force: true });
+	});
+
+	await t.test("observes modifications to files that were already dirty, staged, and renamed", async () => {
+		await writeFile(join(contractWorkspace, "tracked.ts"), "export const dirtyBefore = true;\n");
+		const dirtyResult = await tool.execute(
+			"scope-dirty-test",
+			{ task, model: "_fixture_scope_dirty_", allowedPaths: ["tracked.ts"] },
+			undefined,
+			undefined,
+			contractCtx,
+		);
+		assert.deepEqual(getWorkspaceChanges(dirtyResult).changedPaths, ["tracked.ts"]);
+		await execFileAsync("git", ["checkout", "--", "tracked.ts"], { cwd: contractWorkspace });
+
+		const stagedResult = await tool.execute(
+			"scope-staged-test",
+			{ task, model: "_fixture_scope_stage_", allowedPaths: ["tracked.ts"] },
+			undefined,
+			undefined,
+			contractCtx,
+		);
+		assert.deepEqual(getWorkspaceChanges(stagedResult).changedPaths, ["tracked.ts"]);
+		await execFileAsync("git", ["reset", "--hard", "HEAD"], { cwd: contractWorkspace });
+
+		await mkdir(join(contractWorkspace, "allowed"));
+		await writeFile(join(contractWorkspace, "allowed", "original.txt"), "rename me\n");
+		const renameResult = await tool.execute(
+			"scope-rename-test",
+			{ task, model: "_fixture_scope_rename_", allowedPaths: ["allowed/**"] },
+			undefined,
+			undefined,
+			contractCtx,
+		);
+		assert.deepEqual(getWorkspaceChanges(renameResult).changedPaths, ["allowed/original.txt", "allowed/renamed.txt"]);
+		await rm(join(contractWorkspace, "allowed"), { recursive: true, force: true });
+	});
+
+	await t.test("rejects invalid contracts and read-only use before launching a child", async () => {
+		for (const allowedPaths of [["../escape"], ["/absolute"], ["C:\\\\escape"], ["src/**/partial**"], ["src//nested"]]) {
+			await assert.rejects(
+				tool.execute("invalid-contract", { task, allowedPaths }, undefined, undefined, contractCtx),
+				/allowedPaths entry/,
+			);
+		}
+		await assert.rejects(
+			tool.execute("readonly-contract", { task, access: "read-only", allowedPaths: ["src/**"] }, undefined, undefined, contractCtx),
+			/allowedPaths is only supported with access: "workspace-write"/,
+		);
+	});
+
+	await t.test("marks submodule-like directory entries as partial instead of discarding all observations", async () => {
+		const gitlinkPath = "submodule-placeholder";
+		await mkdir(join(contractWorkspace, gitlinkPath));
+		const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: contractWorkspace });
+		await execFileAsync("git", ["update-index", "--add", "--cacheinfo", `160000,${stdout.trim()},${gitlinkPath}`], { cwd: contractWorkspace });
+		const result = await tool.execute(
+			"partial-contract",
+			{ task, allowedPaths: ["**"] },
+			undefined,
+			undefined,
+			contractCtx,
+		);
+		const changes = getWorkspaceChanges(result);
+		assert.equal(changes.status, "partial");
+		assert.equal(changes.contractStatus, "unknown");
+		assert.match(result.content[0].text, /Contents of directory entry "submodule-placeholder" are not observed/);
+		await execFileAsync("git", ["reset", "--hard", "HEAD"], { cwd: contractWorkspace });
+		await rm(join(contractWorkspace, gitlinkPath), { recursive: true, force: true });
+	});
+
+	await t.test("reports unavailable Git observation and appends reports to child failures", async () => {
+		const unavailable = await tool.execute(
+			"non-git-contract",
+			{ task, allowedPaths: ["src/**"] },
+			undefined,
+			undefined,
+			{ ...ctx, cwd: otherCwd },
+		);
+		assert.equal(getWorkspaceChanges(unavailable).status, "unavailable");
+		assert.match(unavailable.content[0].text, /Workspace observation unavailable/);
+		await assert.rejects(
+			tool.execute(
+				"failed-contract",
+				{ task, model: "_fixture_provider_error_", allowedPaths: ["src/**"] },
+				undefined,
+				undefined,
+				contractCtx,
+			),
+			/Provider rejected the request[\s\S]*Workspace change report \(observational\):[\s\S]*status: available/,
+		);
 	});
 
 	for (const model of [
@@ -662,7 +847,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		await rm(pidFile, { force: true });
 		const updates: AgentToolResult[] = [];
 		const rejection = assert.rejects(
-			tool.execute("timeout-test", { task, model: "_fixture_hanging_tree_", timeoutMs: 1_000 }, undefined, (update) => updates.push(update), ctx),
+			tool.execute("timeout-test", { task, model: "_fixture_hanging_tree_", timeoutMs: 1_000, allowedPaths: ["src/**"] }, undefined, (update) => updates.push(update), contractCtx),
 			(error: unknown) => {
 				assert.ok(error instanceof Error);
 				assert.match(error.message, /^Subagent timed out after 1000ms/);
@@ -674,6 +859,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 				assert.match(error.message, /root process exit observed: yes/);
 				assert.match(error.message, process.platform === "win32" ? /taskkill completed \(exit 0\)/ : /process-group requested/);
 				assert.match(error.message, /known descendants after cleanup: unavailable/);
+				assert.match(error.message, /Workspace change report \(observational\):[\s\S]*status: available/);
 				assert.doesNotMatch(error.message, /Starting bounded work/);
 				return true;
 			},
@@ -693,12 +879,13 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		await rm(pidFile, { force: true });
 		const controller = new AbortController();
 		const rejection = assert.rejects(
-			tool.execute("abort-tree-test", { task, model: "_fixture_hanging_tree_" }, controller.signal, undefined, ctx),
+			tool.execute("abort-tree-test", { task, model: "_fixture_hanging_tree_", allowedPaths: ["src/**"] }, controller.signal, undefined, contractCtx),
 			(error: unknown) => {
 				assert.ok(error instanceof Error);
 				assert.match(error.message, /^Subagent aborted by caller/);
 				assert.match(error.message, /- reason: caller-abort/);
 				assert.match(error.message, /- requested model: _fixture_hanging_tree_/);
+				assert.match(error.message, /Workspace change report \(observational\):[\s\S]*status: available/);
 				return true;
 			},
 		);
@@ -754,6 +941,12 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		const component = tool.renderCall!({ task, timeoutMs: 15_000 }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
 		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[timeout: 15000ms\]/);
+	});
+
+	await t.test("renders allowed-path contract counts", () => {
+		const component = tool.renderCall!({ task, allowedPaths: ["src/**", "test/*.test.ts"] }, theme, renderContext);
+		const text = stripVTControlCharacters(component.render(300).join("\n"));
+		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[allowed paths: 2\]/);
 	});
 
 	await t.test("renders thinking without a model", () => {
