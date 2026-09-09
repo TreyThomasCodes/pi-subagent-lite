@@ -22,6 +22,8 @@ const { spawn } = require("node:child_process");
 const args = process.argv.slice(2);
 const modelIndex = args.indexOf("--model");
 const model = modelIndex === -1 ? undefined : args[modelIndex + 1];
+const modelPreflightFile = process.env.PI_SUBAGENT_TEST_MODEL_PREFLIGHT_FILE;
+const taskSpawnFile = process.env.PI_SUBAGENT_TEST_TASK_SPAWN_FILE;
 const thinkingIndex = args.indexOf("--thinking");
 const thinking = thinkingIndex === -1 ? undefined : args[thinkingIndex + 1];
 const toolsIndex = args.indexOf("--tools");
@@ -29,6 +31,11 @@ const tools = toolsIndex === -1 ? undefined : args[toolsIndex + 1];
 const emit = (message) => process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\n");
 if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
   const mode = process.env.PI_SUBAGENT_TEST_MODE;
+  if (model && modelPreflightFile) fs.appendFileSync(modelPreflightFile, model + "\n");
+  if (mode === "model-rejected" && model === "_fixture_invalid_model_") {
+    process.stderr.write('Model "_fixture_invalid_model_" not found. Use --list-models to see available models.\n');
+    process.exit(1);
+  }
   let input = "";
   const respondWithCatalog = (id) => {
     const response = JSON.stringify({
@@ -76,8 +83,9 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
     const command = JSON.parse(line);
     if (command.type === "get_available_models") {
       if (mode === "hang") return;
-      if (mode === "failure") {
-        process.stdout.write(JSON.stringify({ id: command.id, type: "response", command: command.type, success: false, error: "Fixture discovery failed" }) + "\n");
+      if (mode === "failure" || mode === "failure-no-models") {
+        const error = mode === "failure-no-models" ? "No models available" : "Fixture discovery failed";
+        process.stdout.write(JSON.stringify({ id: command.id, type: "response", command: command.type, success: false, error }) + "\n");
       } else if (mode === "ui") {
         process.stdout.write(JSON.stringify({ type: "extension_ui_request", id: "fixture-dialog", method: "confirm" }) + "\n");
       } else {
@@ -93,45 +101,48 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
     input = lines.pop();
     for (const line of lines) if (line) processCommand(line);
   });
-} else if (model === "_fixture_hanging_tree_") {
-  const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  const promptIndex = args.indexOf("--append-system-prompt");
-  fs.writeFileSync(process.env.PI_SUBAGENT_TEST_PID_FILE, JSON.stringify({
-    pid: descendant.pid,
-    promptFile: promptIndex >= 0 ? args[promptIndex + 1] : undefined,
-  }));
-  setInterval(() => {}, 1000);
-} else if (model === "_fixture_invalid_model_") {
-  process.stderr.write('Model "_fixture_invalid_model_" not found. Use --list-models to see available models.\n');
-  process.exitCode = 1;
-} else if (["_fixture_provider_error_", "_fixture_aborted_", "_fixture_empty_error_"].includes(model)) {
-  emit({
-    role: "assistant",
-    content: [{ type: "text", text: "Incomplete answer that must not be returned as a success" }],
-    stopReason: model === "_fixture_aborted_" ? "aborted" : "error",
-    errorMessage: model === "_fixture_empty_error_" ? undefined : "Provider rejected the request",
-  });
 } else {
-  if (model === "_fixture_recovered_") {
-    emit({ role: "assistant", content: [], stopReason: "error", errorMessage: "Transient provider failure" });
+  if (taskSpawnFile) fs.appendFileSync(taskSpawnFile, (model || "(default)") + "\n");
+  if (model === "_fixture_hanging_tree_") {
+    const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const promptIndex = args.indexOf("--append-system-prompt");
+    fs.writeFileSync(process.env.PI_SUBAGENT_TEST_PID_FILE, JSON.stringify({
+      pid: descendant.pid,
+      promptFile: promptIndex >= 0 ? args[promptIndex + 1] : undefined,
+    }));
+    setInterval(() => {}, 1000);
+  } else if (model === "_fixture_invalid_model_") {
+    process.stderr.write('Model "_fixture_invalid_model_" not found. Use --list-models to see available models.\n');
+    process.exitCode = 1;
+  } else if (["_fixture_provider_error_", "_fixture_aborted_", "_fixture_empty_error_"].includes(model)) {
+    emit({
+      role: "assistant",
+      content: [{ type: "text", text: "Incomplete answer that must not be returned as a success" }],
+      stopReason: model === "_fixture_aborted_" ? "aborted" : "error",
+      errorMessage: model === "_fixture_empty_error_" ? undefined : "Provider rejected the request",
+    });
+  } else {
+    if (model === "_fixture_recovered_") {
+      emit({ role: "assistant", content: [], stopReason: "error", errorMessage: "Transient provider failure" });
+    }
+    const promptFile = args[args.indexOf("--append-system-prompt") + 1];
+    const taskArg = args.at(-1);
+    const spillPrefix = "Task: Please read ";
+    const spillSuffix = " and follow the instructions there.";
+    const task = taskArg.startsWith(spillPrefix)
+      ? fs.readFileSync(taskArg.slice(spillPrefix.length, -spillSuffix.length), "utf8")
+      : taskArg.slice("Task: ".length);
+    const text = JSON.stringify({
+      args,
+      cwd: process.cwd(),
+      disabled: process.env.PI_SUBAGENT_LITE_DISABLE,
+      prompt: fs.readFileSync(promptFile, "utf8"),
+      task,
+      thinking,
+      tools,
+    });
+    emit({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" });
   }
-  const promptFile = args[args.indexOf("--append-system-prompt") + 1];
-  const taskArg = args.at(-1);
-  const spillPrefix = "Task: Please read ";
-  const spillSuffix = " and follow the instructions there.";
-  const task = taskArg.startsWith(spillPrefix)
-    ? fs.readFileSync(taskArg.slice(spillPrefix.length, -spillSuffix.length), "utf8")
-    : taskArg.slice("Task: ".length);
-  const text = JSON.stringify({
-    args,
-    cwd: process.cwd(),
-    disabled: process.env.PI_SUBAGENT_LITE_DISABLE,
-    prompt: fs.readFileSync(promptFile, "utf8"),
-    task,
-    thinking,
-    tools,
-  });
-  emit({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" });
 }
 `;
 
@@ -140,7 +151,11 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	const originalScript = process.argv[1];
 	const originalDisabled = process.env.PI_SUBAGENT_LITE_DISABLE;
 	const originalPidFile = process.env.PI_SUBAGENT_TEST_PID_FILE;
+	const originalModelPreflightFile = process.env.PI_SUBAGENT_TEST_MODEL_PREFLIGHT_FILE;
+	const originalTaskSpawnFile = process.env.PI_SUBAGENT_TEST_TASK_SPAWN_FILE;
 	const pidFile = join(fixtureDir, "descendant.pid");
+	const modelPreflightFile = join(fixtureDir, "model-preflights.log");
+	const taskSpawnFile = join(fixtureDir, "task-spawns.log");
 	const descendantPids = new Set<number>();
 	t.after(async () => {
 		process.argv[1] = originalScript;
@@ -148,6 +163,10 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		else process.env.PI_SUBAGENT_LITE_DISABLE = originalDisabled;
 		if (originalPidFile === undefined) delete process.env.PI_SUBAGENT_TEST_PID_FILE;
 		else process.env.PI_SUBAGENT_TEST_PID_FILE = originalPidFile;
+		if (originalModelPreflightFile === undefined) delete process.env.PI_SUBAGENT_TEST_MODEL_PREFLIGHT_FILE;
+		else process.env.PI_SUBAGENT_TEST_MODEL_PREFLIGHT_FILE = originalModelPreflightFile;
+		if (originalTaskSpawnFile === undefined) delete process.env.PI_SUBAGENT_TEST_TASK_SPAWN_FILE;
+		else process.env.PI_SUBAGENT_TEST_TASK_SPAWN_FILE = originalTaskSpawnFile;
 		for (const pid of descendantPids) {
 			try {
 				process.kill(pid, "SIGKILL");
@@ -166,6 +185,8 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	process.argv[1] = fixtureScript;
 	delete process.env.PI_SUBAGENT_LITE_DISABLE;
 	process.env.PI_SUBAGENT_TEST_PID_FILE = pidFile;
+	process.env.PI_SUBAGENT_TEST_MODEL_PREFLIGHT_FILE = modelPreflightFile;
+	process.env.PI_SUBAGENT_TEST_TASK_SPAWN_FILE = taskSpawnFile;
 	const registeredTools: SubagentTool[] = [];
 	registerSubagent({ registerTool: (tool) => { registeredTools.push(tool); } });
 	const tool = registeredTools.find((candidate) => candidate.name === "subagent");
@@ -340,15 +361,26 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		});
 	}
 
-	await t.test("omitting model preserves defaults even after explicit selection", async () => {
+	await t.test("omitting model preserves defaults without a catalog preflight", async () => {
 		const updates: AgentToolResult[] = [];
-		const invocation = await invoke({ task }, updates);
-		assert.deepEqual(invocation.args.slice(0, 5), ["--mode", "json", "-p", "--no-session", "--append-system-prompt"]);
-		assert.equal(invocation.args.includes("--model"), false);
-		assert.equal(invocation.args.includes("--provider"), false);
-		assert.equal(invocation.args.includes("--thinking"), false);
+		await withDiscoveryMode("failure", async () => {
+			const invocation = await invoke({ task }, updates);
+			assert.deepEqual(invocation.args.slice(0, 5), ["--mode", "json", "-p", "--no-session", "--append-system-prompt"]);
+			assert.equal(invocation.args.includes("--model"), false);
+			assert.equal(invocation.args.includes("--provider"), false);
+			assert.equal(invocation.args.includes("--thinking"), false);
+		});
 		assert.equal(updates[0].content[0].text, "Subagent running (access: workspace-write)...");
 		assert.equal(ctx.model, parentModel);
+	});
+
+	await t.test("preflights returned exact selectors and preserves native shorthand", async () => {
+		await rm(modelPreflightFile, { force: true });
+		const exact = await invoke({ task, model: "fixture/economical-model" });
+		const shorthand = await invoke({ task, model: "economical" });
+		assert.equal(exact.args[5], "fixture/economical-model");
+		assert.equal(shorthand.args[5], "economical");
+		assert.deepEqual((await readFile(modelPreflightFile, "utf8")).trim().split("\n"), ["fixture/economical-model", "economical"]);
 	});
 
 	await t.test("trims surrounding whitespace", async () => {
@@ -448,12 +480,47 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(updates.length, 0);
 	});
 
-	await t.test("propagates child model errors and releases the workspace-write lease", async () => {
+	await t.test("rejects an invalid selector before starting the task child", async () => {
+		await rm(taskSpawnFile, { force: true });
+		const updates: AgentToolResult[] = [];
+		await withDiscoveryMode("model-rejected", async () => {
+			await assert.rejects(
+				tool.execute("invalid-model-test", { task, model: "_fixture_invalid_model_" }, undefined, (update) => updates.push(update), ctx),
+				/Model selector "_fixture_invalid_model_" was rejected before launching a subagent: Model "_fixture_invalid_model_" not found.*Refresh subagent_models/,
+			);
+		});
+		assert.equal(existsSync(taskSpawnFile), false, "invalid selectors must not start the task child");
+		assert.equal(updates.length, 0);
+		await invoke({ task, access: "workspace-write" });
+	});
+
+	await t.test("reports catalog failures distinctly from invalid selectors", async () => {
+		const updates: AgentToolResult[] = [];
+		await withDiscoveryMode("failure", async () => {
+			await assert.rejects(
+				tool.execute("catalog-failure-test", { task, model: "fixture/economical-model" }, undefined, (update) => updates.push(update), ctx),
+				/Unable to validate model selector "fixture\/economical-model" because live model discovery failed: Fixture discovery failed.*Retry subagent_models/,
+			);
+		});
+		assert.equal(updates.length, 0);
+	});
+
+	await t.test("does not mislabel a catalog response as selector rejection", async () => {
+		await withDiscoveryMode("failure-no-models", async () => {
+			await assert.rejects(
+				tool.execute("catalog-no-models-test", { task, model: "fixture/economical-model" }, undefined, undefined, ctx),
+				/Unable to validate model selector "fixture\/economical-model" because live model discovery failed: No models available/,
+			);
+		});
+	});
+
+	await t.test("surfaces a task-child model failure after a successful advisory preflight", async () => {
+		await rm(taskSpawnFile, { force: true });
 		await assert.rejects(
 			invoke({ task, model: "_fixture_invalid_model_" }),
 			/Model "_fixture_invalid_model_" not found\. Use --list-models/,
 		);
-		await invoke({ task, access: "workspace-write" });
+		assert.deepEqual((await readFile(taskSpawnFile, "utf8")).trim().split("\n"), ["_fixture_invalid_model_"]);
 	});
 
 	await t.test("releases the workspace-write lease after a spawn error", async () => {

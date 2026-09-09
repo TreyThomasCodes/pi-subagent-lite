@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Preflight explicit model selectors with the same Pi runtime used by `subagent_models`, preserving native selector resolution and rejecting invalid selections before a task child starts.
 - Defined a generic delegation packet and provisional-result contract in parent guidance, the child system prompt, examples, and tests.
 - Added per-process workspace-write leases that reject concurrent subagents targeting the same working directory while preserving parallel read-only and different-directory calls.
 - Added optional bounded subagent runtimes with distinct timeout/cancellation errors and cross-platform process-tree termination.
