@@ -310,9 +310,25 @@ function normalizeDiscoveredModels(models: unknown[]): DiscoveredModel[] {
 	}).sort((a, b) => a.selector.localeCompare(b.selector));
 }
 
-async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<string> {
+class ModelDiscoveryError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ModelDiscoveryError";
+	}
+}
+
+class PiStartupError extends ModelDiscoveryError {
+	constructor(message: string) {
+		super(message);
+		this.name = "PiStartupError";
+	}
+}
+
+async function listSubagentModels(cwd: string, signal?: AbortSignal, modelSelector?: string): Promise<string> {
 	const requestId = "subagent-models";
-	const invocation = getPiInvocation(["--mode", "rpc", "--no-session"]);
+	const args = ["--mode", "rpc", "--no-session"];
+	if (modelSelector) args.push("--model", modelSelector);
+	const invocation = getPiInvocation(args);
 	const proc = spawn(invocation.command, invocation.args, {
 		cwd,
 		shell: false,
@@ -429,16 +445,41 @@ async function listSubagentModels(cwd: string, signal?: AbortSignal): Promise<st
 		}
 	});
 
-	if (aborted || signal?.aborted) throw new Error("Model discovery aborted");
-	if (timedOut) throw new Error(`Model discovery timed out after ${MODEL_DISCOVERY_TIMEOUT_MS / 1000} seconds`);
+	if (aborted || signal?.aborted) throw new ModelDiscoveryError("Model discovery aborted");
+	if (timedOut) throw new ModelDiscoveryError(`Model discovery timed out after ${MODEL_DISCOVERY_TIMEOUT_MS / 1000} seconds`);
 	// A correlated RPC response intentionally terminates the persistent child,
 	// so process-tree termination may produce a non-zero platform exit code.
 	if (exitCode !== 0 && !models && !rpcError) {
-		throw spawnError ?? stdinError ?? new Error(stderr.trim() || `Pi exited with code ${exitCode}`);
+		const error = spawnError ?? new Error(stderr.trim() || stdinError?.message || `Pi exited with code ${exitCode}`);
+		throw new PiStartupError(error.message);
 	}
-	if (rpcError) throw new Error(rpcError);
-	if (!models) throw new Error(stdinError?.message || stderr.trim() || "Pi did not return a model catalog");
+	if (rpcError) throw new ModelDiscoveryError(rpcError);
+	if (!models) throw new ModelDiscoveryError(stdinError?.message || stderr.trim() || "Pi did not return a model catalog");
 	return JSON.stringify({ schemaVersion: 1, source: "isolated-pi-rpc", models: normalizeDiscoveredModels(models) }, null, 2);
+}
+
+function isPiModelSelectorRejection(message: string): boolean {
+	return /(?:Unknown provider|Model ".+" (?:not found|is ambiguous)|No models available)/i.test(message);
+}
+
+async function validateModelSelector(cwd: string, modelSelector: string, signal?: AbortSignal): Promise<void> {
+	try {
+		// Starting the same Pi runtime in RPC mode lets its native CLI resolver
+		// validate exact selectors, patterns, and :thinking suffixes without
+		// starting the task-bearing JSON child process.
+		await listSubagentModels(cwd, signal, modelSelector);
+	} catch (error) {
+		if (signal?.aborted) throw new Error("Subagent aborted by caller");
+		const message = error instanceof Error ? error.message : String(error);
+		if (error instanceof PiStartupError && isPiModelSelectorRejection(message)) {
+			throw new Error(
+				`Model selector ${JSON.stringify(modelSelector)} was rejected before launching a subagent: ${message} Refresh subagent_models and choose an available selector.`,
+			);
+		}
+		throw new Error(
+			`Unable to validate model selector ${JSON.stringify(modelSelector)} because live model discovery failed: ${message} Retry subagent_models before launching another subagent.`,
+		);
+	}
 }
 
 async function runSubagent(
@@ -457,12 +498,17 @@ async function runSubagent(
 	}
 	if (signal?.aborted) throw new Error("Subagent aborted by caller");
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (access === "read-only") args.push("--tools", READ_ONLY_TOOLS.join(","));
 	const modelSelector = model?.trim();
 	if (modelSelector !== undefined) {
 		if (!modelSelector) throw new Error("model must be a non-empty Pi model ID or provider/model selector");
-		// Let Pi resolve providers, shorthand matches, and thinking-level suffixes.
+		await validateModelSelector(cwd, modelSelector, signal);
+	}
+
+	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	if (access === "read-only") args.push("--tools", READ_ONLY_TOOLS.join(","));
+	if (modelSelector) {
+		// Pi performs its native resolution again when launching the task child;
+		// the preflight is advisory because configuration can change in between.
 		args.push("--model", modelSelector);
 	}
 	if (thinking) args.push("--thinking", thinking);

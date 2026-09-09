@@ -26,7 +26,7 @@ Lightweight delegation without agent definition files or a separate configuratio
 - **Live progress**: See turn-by-turn updates as the subagent works
 - **Model discovery**: Get the isolated child's live model catalog, including selectors, capabilities, token limits, thinking levels, and configured cost metadata
 - **Per-call access modes**: Enforce a `read-only` Pi tool allowlist or preserve normal tools with `workspace-write`
-- **Per-call model selection**: Choose a different model for each subagent with Pi's native `--model` selectors
+- **Preflighted model selection**: Choose a different model for each subagent with Pi's native `--model` selectors, validated before the task child starts
 - **Bounded runtime**: Optionally cap a child run and terminate its process tree on timeout or caller cancellation
 - **Workspace-write coordination**: Reject concurrent writers targeting the same working directory while preserving parallel read-only work
 - **Optional skills**: Preload capabilities via `--skill` flags
@@ -154,9 +154,10 @@ Or specify it in a `subagent` tool call, with or without skills:
 ```
 
 - Prefer a full selector returned by `subagent_models`, usually `provider/model`, to avoid ambiguity. Pi shorthand selectors also work when they resolve uniquely.
+- Before starting the task-bearing child, an explicit selector is checked by starting the same Pi executable and configuration in a short-lived RPC validation process. Pi performs its own exact/pattern/`:thinking` resolution; the extension does not implement a competing matcher. If Pi rejects the selector, no task child starts and the error directs you to refresh `subagent_models`. A configuration race after preflight can still cause the task child to fail normally.
 - Set `thinking` to Pi's explicit level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`). It is passed as `--thinking` and shown separately in the subagent window. Pi's `:thinking` model-selector suffix is also passed through for backwards compatibility.
-- Use `subagent_models` before the first model-selected delegation in a fresh session, and again after changing model configuration. It queries Pi RPC against the same environment as the isolated child. Select explicitly based on objective needs such as image input, context, output budget, thinking support, and configured cost metadata; the catalog does not establish relative model quality, actual billing, latency, or reliability. Providers, authentication, and custom models must be configured for the child Pi process as usual; no separate subagent credentials are needed. Parent-only in-memory configuration is not copied into the child.
-- **When omitted**, no `--model` flag is passed. The child uses Pi's normal configured default/fallback selection, preserving the original behavior. It does **not** automatically inherit the parent session's active model, and selecting a subagent model does not change the parent's model.
+- Use `subagent_models` before the first model-selected delegation in a fresh session, and again after changing model configuration. It queries Pi RPC against the same environment as the isolated child. Select explicitly based on objective needs such as image input, context, output budget, thinking support, and configured cost metadata; the catalog does not establish relative model quality, actual billing, latency, or reliability. Providers, authentication, and custom models must be configured for the child Pi process as usual; no separate subagent credentials are needed. Parent-only in-memory configuration is not copied into the child. A discovery/startup failure during preflight is reported separately from a selector Pi rejected.
+- **When omitted**, no `--model` flag is passed and no catalog preflight occurs. The child uses Pi's normal configured default/fallback selection, preserving the original behavior. It does **not** automatically inherit the parent session's active model, and selecting a subagent model does not change the parent's model.
 - Leading/trailing whitespace is trimmed. Empty or whitespace-only selectors are rejected. Model resolution and provider errors from Pi are reported as tool failures.
 - The requested model and explicit thinking level are shown in the tool header and initial progress update.
 
@@ -166,7 +167,7 @@ Or specify it in a `subagent` tool call, with or without skills:
 |-----------|------|----------|-------------|
 | `task` | `string` | Yes | Bounded delegation task; for non-trivial work, state objective, scope, access expectations, exclusions, verification, stopping conditions, and report format |
 | `access` | `"read-only" \| "workspace-write"` | No | Child tool access mode; defaults to `workspace-write`. `read-only` enables only `read`, `grep`, `find`, and `ls` |
-| `model` | `string` | No | A selector returned by `subagent_models`, preferably `provider/model`, passed via `--model`; defaults to the child Pi process's normal model selection |
+| `model` | `string` | No | A Pi selector, preferably one returned by `subagent_models`; preflighted with the same child Pi executable before passing it via `--model`; omitted uses the child Pi process's normal model selection |
 | `thinking` | `"off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | No | Child thinking level, passed via `--thinking` and displayed beside the model |
 | `timeoutMs` | `integer` | No | Maximum child runtime in milliseconds, from `1000` through `86400000`; omitted means no extension-imposed deadline |
 | `skills` | `string[]` | No | Optional skill paths or names to load via `--skill` |
