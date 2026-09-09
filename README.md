@@ -114,9 +114,27 @@ You can also invoke multiple read-only subagents in parallel by making separate 
 `access` controls which Pi tools the child receives:
 
 - `read-only` passes Pi the strict allowlist `read,grep,find,ls`. Shell tools (`bash` and `powershell`), file mutation tools (`edit` and `write`), and other extension/custom tools are not enabled.
+- `repository-read` passes those filesystem inspection tools plus fixed structured Git read tools: `repository_git_status`, `repository_git_diff`, `repository_git_show`, and `repository_git_log`. Set `githubRead: true` to additionally enable `repository_github_issue_view` and `repository_github_pull_request_view`. It does not enable arbitrary shell, Git, or `gh` commands.
 - `workspace-write` passes no tool override and therefore preserves the child Pi process's normal configured tool set. This is the default when `access` is omitted, preserving compatibility with earlier versions.
 
-The selected mode is shown in the tool call and initial progress update. These modes control the child's callable Pi tools; they are **not an operating-system sandbox**. The child still inherits the parent process environment and working directory, and filesystem visibility is not isolated. `workspace-write` does not confine writes to that directory, while `read-only` cannot prevent loaded extension startup/lifecycle code, another process, or external tools from changing files. Review trusted skills, context files, and extensions accordingly.
+The selected mode is shown in the tool call and initial progress update. These modes control the child's callable Pi tools; they are **not an operating-system sandbox**. The child still inherits the parent process environment and working directory, including Git/GitHub credential visibility for `repository-read`. Filesystem visibility is not isolated. `workspace-write` does not confine writes to that directory, while `read-only` and `repository-read` cannot prevent loaded extension startup/lifecycle code, another process, or external tools from changing files. Review trusted skills, context files, and extensions accordingly.
+
+### Reading repository evidence
+
+`repository-read` is a deliberately narrow alternative to granting `workspace-write` just to investigate a repository. It registers the following child-only wrappers instead of exposing a shell:
+
+| Tool | Structured input | Fixed read operation |
+|------|------------------|----------------------|
+| `repository_git_status` | none | `git status --short --branch --untracked-files=normal` |
+| `repository_git_diff` | optional `staged` boolean | working-tree or staged diff, with external diff/text conversion disabled |
+| `repository_git_show` | optional simple ref/object ID | one revision's metadata, statistics, and patch |
+| `repository_git_log` | optional `limit` integer (1–100) | recent history from `HEAD` |
+| `repository_github_issue_view` | positive issue number | one issue in the current repository (`githubRead: true` only) |
+| `repository_github_pull_request_view` | positive pull-request number | one pull request in the current repository (`githubRead: true` only) |
+
+The wrappers pass literal, shell-free argument arrays and reject Git flags, ranges, pathspecs, arbitrary refs with unsafe syntax, arbitrary `gh` subcommands, and invalid numbers. Each command is bounded to 10 seconds and returned output is capped at 2,000 lines or 50 KiB. The GitHub wrappers pass no tool-supplied repository selector and normally use the repository `gh` infers from the child cwd; they cannot select another repository or mutate GitHub state through tool arguments.
+
+Git errors explicitly identify a missing Git executable or non-worktree cwd. GitHub errors explicitly distinguish a missing `gh` executable, authentication failure, and likely network failure. `gh` credentials, repository defaults (including environment configuration), and network configuration remain inherited from the child environment, so `githubRead` can disclose issue/PR content accessible to those credentials. This is still a Pi tool boundary, not a sandbox or credential-isolation mechanism.
 
 ### Coordinating workspace writes
 
@@ -177,7 +195,8 @@ Or specify it in a `subagent` tool call, with or without skills:
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task` | `string` | Yes | Bounded delegation task; for non-trivial work, state objective, scope, access expectations, exclusions, verification, stopping conditions, and report format |
-| `access` | `"read-only" \| "workspace-write"` | No | Child tool access mode; defaults to `workspace-write`. `read-only` enables only `read`, `grep`, `find`, and `ls` |
+| `access` | `"read-only" \| "repository-read" \| "workspace-write"` | No | Child tool access mode; defaults to `workspace-write`. `repository-read` adds fixed structured Git reads without shell access |
+| `githubRead` | `boolean` | No | `repository-read` only. Adds bounded GitHub issue/PR view tools using inherited `gh` credentials; it does not expose arbitrary `gh` commands |
 | `model` | `string` | No | A Pi selector, preferably one returned by `subagent_models`; preflighted with the same child Pi executable before passing it via `--model`; omitted uses the child Pi process's normal model selection |
 | `thinking` | `"off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | No | Child thinking level, passed via `--thinking` and displayed beside the model |
 | `timeoutMs` | `integer` | No | Maximum child runtime in milliseconds, from `1000` through `86400000`; omitted means no extension-imposed deadline |

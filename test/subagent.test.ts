@@ -10,12 +10,12 @@ import { promisify, stripVTControlCharacters } from "node:util";
 import type { AgentToolResult, ExtensionAPI, ToolRenderContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
-import registerSubagent from "../index.js";
+import registerSubagent, { classifyRepositoryReadFailure, registerRepositoryReadTools } from "../index.js";
 
 type SubagentTool = Parameters<ExtensionAPI["registerTool"]>[0];
-type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; allowedPaths?: string[]; skills?: string[] };
+type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; allowedPaths?: string[]; githubRead?: boolean; skills?: string[] };
 const execFileAsync = promisify(execFile);
-type Invocation = { args: string[]; cwd: string; disabled: string; prompt: string; task: string; thinking?: string; tools?: string };
+type Invocation = { args: string[]; cwd: string; disabled: string; repositoryRead?: string; githubRead?: string; prompt: string; task: string; thinking?: string; tools?: string };
 
 // Exercise the real spawn/argument/parsing path without invoking Pi or a paid model.
 const FAKE_PI = String.raw`
@@ -166,9 +166,11 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
       : taskArg.slice("Task: ".length);
     const text = JSON.stringify({
       args,
-      cwd: process.cwd(),
-      disabled: process.env.PI_SUBAGENT_LITE_DISABLE,
-      prompt: fs.readFileSync(promptFile, "utf8"),
+       cwd: process.cwd(),
+       disabled: process.env.PI_SUBAGENT_LITE_DISABLE,
+       repositoryRead: process.env.PI_SUBAGENT_LITE_REPOSITORY_READ,
+       githubRead: process.env.PI_SUBAGENT_LITE_GITHUB_READ,
+       prompt: fs.readFileSync(promptFile, "utf8"),
       task,
       thinking,
       tools,
@@ -377,6 +379,10 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(Value.Check(schema, { task, thinking: "high" }), true);
 		assert.equal(Value.Check(schema, { task, thinking: "ultra" }), false);
 		assert.equal(Value.Check(schema, { task, access: "read-only" }), true);
+		assert.equal(Value.Check(schema, { task, access: "repository-read" }), true);
+		assert.equal(Value.Check(schema, { task, access: "repository-read", githubRead: true }), true);
+		assert.equal(Value.Check(schema, { task, githubRead: false }), true);
+		assert.equal(Value.Check(schema, { task, githubRead: "true" }), false);
 		assert.equal(Value.Check(schema, { task, access: "workspace-write" }), true);
 		assert.equal(Value.Check(schema, { task, access: "write" }), false);
 		assert.equal(Value.Check(schema, { task, timeoutMs: 1_000 }), true);
@@ -623,6 +629,92 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.match(invocation.prompt, /read-only access mode/);
 		assert.match(invocation.prompt, /do not modify the workspace/);
 		assert.equal(updates[0].content[0].text, "Subagent running (access: read-only)...");
+	});
+
+	await t.test("repository-read exposes fixed Git tools and optional GitHub views without a shell", async () => {
+		const updates: AgentToolResult[] = [];
+		const repositoryRead = await invoke({ task, access: "repository-read" }, updates);
+		assert.equal(repositoryRead.tools, "read,grep,find,ls,repository_git_status,repository_git_diff,repository_git_show,repository_git_log");
+		assert.equal(repositoryRead.args.includes("bash"), false);
+		assert.equal(repositoryRead.disabled, "false");
+		assert.equal(repositoryRead.repositoryRead, "true");
+		assert.equal(repositoryRead.githubRead, undefined);
+		assert.match(repositoryRead.prompt, /repository-read access mode/);
+		assert.match(repositoryRead.prompt, /shell, edit, and write tools are unavailable/);
+		assert.equal(updates[0].content[0].text, "Subagent running (access: repository-read)...");
+
+		const withGitHub = await invoke({ task, access: "repository-read", githubRead: true });
+		assert.equal(withGitHub.tools, "read,grep,find,ls,repository_git_status,repository_git_diff,repository_git_show,repository_git_log,repository_github_issue_view,repository_github_pull_request_view");
+		assert.equal(withGitHub.githubRead, "true");
+		assert.match(withGitHub.prompt, /Git and GitHub issue\/pull-request operations/);
+	});
+
+	await t.test("repository-read child bootstrap registers only its configured wrappers", () => {
+		const originalRepositoryRead = process.env.PI_SUBAGENT_LITE_REPOSITORY_READ;
+		const originalGitHubRead = process.env.PI_SUBAGENT_LITE_GITHUB_READ;
+		try {
+			process.env.PI_SUBAGENT_LITE_REPOSITORY_READ = "true";
+			delete process.env.PI_SUBAGENT_LITE_GITHUB_READ;
+			const gitOnly: SubagentTool[] = [];
+			registerSubagent({ registerTool: (candidate) => { gitOnly.push(candidate); } });
+			assert.deepEqual(gitOnly.map((candidate) => candidate.name), ["repository_git_status", "repository_git_diff", "repository_git_show", "repository_git_log"]);
+
+			process.env.PI_SUBAGENT_LITE_GITHUB_READ = "true";
+			const withGitHub: SubagentTool[] = [];
+			registerSubagent({ registerTool: (candidate) => { withGitHub.push(candidate); } });
+			assert.deepEqual(withGitHub.map((candidate) => candidate.name), [
+				"repository_git_status", "repository_git_diff", "repository_git_show", "repository_git_log",
+				"repository_github_issue_view", "repository_github_pull_request_view",
+			]);
+		} finally {
+			if (originalRepositoryRead === undefined) delete process.env.PI_SUBAGENT_LITE_REPOSITORY_READ;
+			else process.env.PI_SUBAGENT_LITE_REPOSITORY_READ = originalRepositoryRead;
+			if (originalGitHubRead === undefined) delete process.env.PI_SUBAGENT_LITE_GITHUB_READ;
+			else process.env.PI_SUBAGENT_LITE_GITHUB_READ = originalGitHubRead;
+		}
+	});
+
+	await t.test("repository-read wrappers accept only structured non-mutating inputs", async () => {
+		const repositoryTools: SubagentTool[] = [];
+		registerRepositoryReadTools({ registerTool: (candidate) => { repositoryTools.push(candidate); } }, true);
+		assert.deepEqual(repositoryTools.map((candidate) => candidate.name), [
+			"repository_git_status", "repository_git_diff", "repository_git_show", "repository_git_log",
+			"repository_github_issue_view", "repository_github_pull_request_view",
+		]);
+		assert.equal(repositoryTools.some((candidate) => /bash|powershell|edit|write/.test(candidate.name)), false);
+		const status = repositoryTools.find((candidate) => candidate.name === "repository_git_status");
+		const diff = repositoryTools.find((candidate) => candidate.name === "repository_git_diff");
+		const show = repositoryTools.find((candidate) => candidate.name === "repository_git_show");
+		const log = repositoryTools.find((candidate) => candidate.name === "repository_git_log");
+		const issue = repositoryTools.find((candidate) => candidate.name === "repository_github_issue_view");
+		assert.ok(status && diff && show && log && issue);
+		assert.match((await status.execute("repository-status", {}, undefined, undefined, contractCtx)).content[0].text, /^## /);
+		assert.equal((await diff.execute("repository-diff", {}, undefined, undefined, contractCtx)).content[0].text, "(no output)");
+		assert.match((await show.execute("repository-show", { revision: "HEAD" }, undefined, undefined, contractCtx)).content[0].text, /fixture baseline/);
+		assert.match((await log.execute("repository-log", { limit: 1 }, undefined, undefined, contractCtx)).content[0].text, /fixture baseline/);
+		await assert.rejects(show.execute("repository-show-invalid", { revision: "--upload-pack=evil" }, undefined, undefined, contractCtx), /not a flag/);
+		await assert.rejects(show.execute("repository-show-range", { revision: "HEAD~1..HEAD" }, undefined, undefined, contractCtx), /not a flag/);
+		await assert.rejects(log.execute("repository-log-invalid", { limit: 101 }, undefined, undefined, contractCtx), /between 1 and 100/);
+		await assert.rejects(issue.execute("repository-issue-invalid", { number: 0 }, undefined, undefined, contractCtx), /positive integer/);
+		await assert.rejects(status.execute("repository-status-non-git", {}, undefined, undefined, { ...ctx, cwd: otherCwd }), /not inside a Git worktree/);
+		assert.match(classifyRepositoryReadFailure("git", "spawn git ENOENT").message, /Git executable is unavailable/);
+		assert.match(classifyRepositoryReadFailure("gh", "spawn gh ENOENT").message, /GitHub CLI \(gh\) is unavailable/);
+		assert.match(classifyRepositoryReadFailure("gh", "not logged into any GitHub hosts").message, /GitHub read authentication failed/);
+		assert.match(classifyRepositoryReadFailure("gh", "could not resolve host").message, /GitHub read network request failed/);
+		assert.match(classifyRepositoryReadFailure("gh", "unexpected response").message, /GitHub repository read failed/);
+	});
+
+	await t.test("repository-only options are rejected for incompatible access modes before launching a child", async () => {
+		for (const githubRead of [false, true]) {
+			await assert.rejects(
+				tool.execute("github-read-invalid", { task, githubRead }, undefined, undefined, ctx),
+				/githubRead is only supported with access: "repository-read"/,
+			);
+		}
+		await assert.rejects(
+			tool.execute("repository-contract-invalid", { task, access: "repository-read", allowedPaths: ["src/**"] }, undefined, undefined, ctx),
+			/allowedPaths is only supported with access: "workspace-write"/,
+		);
 	});
 
 	await t.test("explicit workspace-write mode preserves Pi's normal tool configuration", async () => {
@@ -926,6 +1018,12 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		const component = tool.renderCall!({ task, access: "read-only" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
 		assert.match(text, /subagent Find all test files \[access: read-only\]/);
+	});
+
+	await t.test("renders repository-read access and the GitHub capability in the header", () => {
+		const component = tool.renderCall!({ task, access: "repository-read", githubRead: true }, theme, renderContext);
+		const text = stripVTControlCharacters(component.render(300).join("\n"));
+		assert.match(text, /subagent Find all test files \[access: repository-read\] \[GitHub read\]/);
 	});
 
 	await t.test("renders calls without a model and partial arguments", () => {
