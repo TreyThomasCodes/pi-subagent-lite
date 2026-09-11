@@ -119,8 +119,32 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
     emit({ role: "assistant", content: [{ type: "text", text: "Earlier terminal error must not be treated as final" }], stopReason: "error", errorMessage: "Transient provider failure" });
     emit({ role: "assistant", content: [{ type: "text", text: "Retry is still running" }], stopReason: "toolUse" });
     setInterval(() => {}, 1000);
+  } else if (model === "_fixture_large_valid_protocol_") {
+    process.stdout.write(JSON.stringify({
+      type: "message_end",
+      padding: "x".repeat(1_000_001),
+      message: { role: "assistant", content: [{ type: "text", text: "Large protocol record accepted" }], stopReason: "stop" },
+    }) + "\n");
+  } else if (model === "_fixture_oversized_then_final_") {
+    const progress = JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "x".repeat(2048) }], stopReason: "toolUse" },
+    }) + "\n";
+    const response = Buffer.from(JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "Recovered É after oversized progress" }], stopReason: "stop" },
+    }) + "\n");
+    const split = response.indexOf(Buffer.from("É")) + 1;
+    process.stdout.write(progress.slice(0, 700));
+    setImmediate(() => {
+      process.stdout.write(progress.slice(700));
+      process.stdout.write(response.subarray(0, split));
+      setImmediate(() => process.stdout.write(response.subarray(split)));
+    });
   } else if (model === "_fixture_oversized_protocol_") {
-    process.stdout.write("x".repeat(1_000_001) + "\n");
+    process.stdout.write("x".repeat(2048));
+  } else if (model === "_fixture_malformed_protocol_") {
+    process.stdout.write('{"type":"message_end"');
   } else if (model === "_fixture_signaled_") {
     process.kill(process.pid, "SIGTERM");
   } else if (model === "_fixture_invalid_model_") {
@@ -187,6 +211,7 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	const originalPidFile = process.env.PI_SUBAGENT_TEST_PID_FILE;
 	const originalModelPreflightFile = process.env.PI_SUBAGENT_TEST_MODEL_PREFLIGHT_FILE;
 	const originalTaskSpawnFile = process.env.PI_SUBAGENT_TEST_TASK_SPAWN_FILE;
+	const originalMaxProtocolRecordChars = process.env.PI_SUBAGENT_LITE_MAX_PROTOCOL_RECORD_CHARS;
 	const pidFile = join(fixtureDir, "descendant.pid");
 	const modelPreflightFile = join(fixtureDir, "model-preflights.log");
 	const taskSpawnFile = join(fixtureDir, "task-spawns.log");
@@ -201,6 +226,8 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		else process.env.PI_SUBAGENT_TEST_MODEL_PREFLIGHT_FILE = originalModelPreflightFile;
 		if (originalTaskSpawnFile === undefined) delete process.env.PI_SUBAGENT_TEST_TASK_SPAWN_FILE;
 		else process.env.PI_SUBAGENT_TEST_TASK_SPAWN_FILE = originalTaskSpawnFile;
+		if (originalMaxProtocolRecordChars === undefined) delete process.env.PI_SUBAGENT_LITE_MAX_PROTOCOL_RECORD_CHARS;
+		else process.env.PI_SUBAGENT_LITE_MAX_PROTOCOL_RECORD_CHARS = originalMaxProtocolRecordChars;
 		for (const pid of descendantPids) {
 			try {
 				process.kill(pid, "SIGKILL");
@@ -314,16 +341,18 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.match(guidelines, /successful subagent result.*provisional report.*not proof.*tests passed.*accepted/i);
 	});
 
-	const withDiscoveryMode = async (mode: string, action: () => Promise<void>) => {
-		const originalMode = process.env.PI_SUBAGENT_TEST_MODE;
-		process.env.PI_SUBAGENT_TEST_MODE = mode;
+	const withEnvironmentValue = async (name: string, value: string, action: () => Promise<void>) => {
+		const originalValue = process.env[name];
+		process.env[name] = value;
 		try {
 			await action();
 		} finally {
-			if (originalMode === undefined) delete process.env.PI_SUBAGENT_TEST_MODE;
-			else process.env.PI_SUBAGENT_TEST_MODE = originalMode;
+			if (originalValue === undefined) delete process.env[name];
+			else process.env[name] = originalValue;
 		}
 	};
+	const withDiscoveryMode = (mode: string, action: () => Promise<void>) => withEnvironmentValue("PI_SUBAGENT_TEST_MODE", mode, action);
+	const withProtocolRecordLimit = (value: string, action: () => Promise<void>) => withEnvironmentValue("PI_SUBAGENT_LITE_MAX_PROTOCOL_RECORD_CHARS", value, action);
 
 	await t.test("cancels blocking extension UI requests during model discovery", async () => {
 		await withDiscoveryMode("ui", async () => {
@@ -849,13 +878,53 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		);
 	});
 
-	await t.test("does not silently accept oversized protocol output", async () => {
+	await t.test("accepts a valid protocol record larger than the former one-million-character limit", async () => {
+		const result = await tool.execute(
+			"large-valid-protocol-test",
+			{ task, model: "_fixture_large_valid_protocol_" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.equal(result.content[0].text, "Large protocol record accepted");
+	});
+
+	await t.test("skips an oversized intermediate record and accepts a later fragmented final response", async () => {
+		await withProtocolRecordLimit("1024", async () => {
+			const result = await tool.execute(
+				"oversized-then-final-test",
+				{ task, model: "_fixture_oversized_then_final_" },
+				undefined,
+				undefined,
+				ctx,
+			);
+			assert.equal(result.content[0].text, "Recovered É after oversized progress");
+		});
+	});
+
+	await t.test("fails accurately when an unterminated oversized record prevents a final response", async () => {
+		await withProtocolRecordLimit("1024", async () => {
+			await assert.rejects(
+				tool.execute("oversized-protocol-test", { task, model: "_fixture_oversized_protocol_" }, undefined, undefined, ctx),
+				(error: unknown) => {
+					assert.ok(error instanceof Error);
+					assert.match(error.message, /Subagent skipped 1 protocol record exceeding the 1024-character per-record limit without receiving a valid final response/);
+					assert.match(error.message, /- oversized protocol records skipped: 1 \(limit: 1024 characters per record\)/);
+					assert.match(error.message, /- reason: abnormal-exit/);
+					return true;
+				},
+			);
+		});
+	});
+
+	await t.test("fails when malformed unterminated output contains no final response", async () => {
 		await assert.rejects(
-			tool.execute("oversized-protocol-test", { task, model: "_fixture_oversized_protocol_" }, undefined, undefined, ctx),
+			tool.execute("malformed-protocol-test", { task, model: "_fixture_malformed_protocol_" }, undefined, undefined, ctx),
 			(error: unknown) => {
 				assert.ok(error instanceof Error);
-				assert.match(error.message, /Subagent protocol output exceeded 1000000 characters/);
-				assert.match(error.message, /- reason: abnormal-exit/);
+				assert.match(error.message, /Subagent exited without a valid final assistant response/);
+				assert.match(error.message, /- final child response received: no/);
+				assert.doesNotMatch(error.message, /- oversized protocol records skipped:/);
 				return true;
 			},
 		);

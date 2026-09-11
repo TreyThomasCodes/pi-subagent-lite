@@ -24,7 +24,7 @@ const RECOVERY_PROGRESS_LIMIT = 8;
 const RECOVERY_CLEANUP_GRACE_MS = 5_000;
 const TASKKILL_GRACE_MS = 2_000;
 const MAX_DIAGNOSTIC_DETAIL_LENGTH = 240;
-const MAX_PROTOCOL_BUFFER_LENGTH = 1_000_000;
+const DEFAULT_MAX_PROTOCOL_RECORD_CHARS = 16 * 1024 * 1024;
 const MAX_STDERR_TAIL_LENGTH = 4_000;
 const MAX_ALLOWED_PATHS = 100;
 const MAX_ALLOWED_PATH_LENGTH = 512;
@@ -715,6 +715,74 @@ function appendBoundedTail(existing: string, addition: string, limit: number): s
 	return combined.length > limit ? combined.slice(-limit) : combined;
 }
 
+export function getMaxProtocolRecordChars(value: string | undefined): number {
+	if (value === undefined) return DEFAULT_MAX_PROTOCOL_RECORD_CHARS;
+	const normalized = value.trim();
+	if (!/^[1-9]\d*$/.test(normalized)) {
+		throw new Error(`PI_SUBAGENT_LITE_MAX_PROTOCOL_RECORD_CHARS must be a positive safe integer; received ${JSON.stringify(value)}`);
+	}
+	const parsed = Number(normalized);
+	if (!Number.isSafeInteger(parsed)) {
+		throw new Error(`PI_SUBAGENT_LITE_MAX_PROTOCOL_RECORD_CHARS must be a positive safe integer; received ${JSON.stringify(value)}`);
+	}
+	return parsed;
+}
+
+export function createBoundedProtocolLineReader(maxRecordChars: number, processLine: (line: string) => void) {
+	if (!Number.isSafeInteger(maxRecordChars) || maxRecordChars < 1) {
+		throw new Error("maxRecordChars must be a positive safe integer");
+	}
+
+	let buffer = "";
+	let discardingOversizedRecord = false;
+	let oversizedRecordCount = 0;
+
+	const push = (text: string) => {
+		let cursor = 0;
+		while (cursor < text.length) {
+			const newlineIndex = text.indexOf("\n", cursor);
+			if (discardingOversizedRecord) {
+				if (newlineIndex === -1) return;
+				discardingOversizedRecord = false;
+				cursor = newlineIndex + 1;
+				continue;
+			}
+
+			const segmentEnd = newlineIndex === -1 ? text.length : newlineIndex;
+			const segmentLength = segmentEnd - cursor;
+			if (buffer.length + segmentLength > maxRecordChars) {
+				buffer = "";
+				oversizedRecordCount++;
+				if (newlineIndex === -1) {
+					discardingOversizedRecord = true;
+					return;
+				}
+				cursor = newlineIndex + 1;
+				continue;
+			}
+
+			if (segmentLength > 0) buffer += text.slice(cursor, segmentEnd);
+			if (newlineIndex === -1) return;
+			const line = buffer;
+			buffer = "";
+			processLine(line);
+			cursor = newlineIndex + 1;
+		}
+	};
+
+	const finish = () => {
+		if (!discardingOversizedRecord && buffer.trim()) processLine(buffer);
+		buffer = "";
+		discardingOversizedRecord = false;
+	};
+
+	return {
+		push,
+		finish,
+		getOversizedRecordCount: () => oversizedRecordCount,
+	};
+}
+
 function terminateProcessDirectly(proc: ChildProcess): TerminationAttempt {
 	try {
 		return { method: "direct-kill", outcome: proc.kill("SIGKILL") ? "requested" : "failed" };
@@ -803,6 +871,8 @@ type RecoveryDiagnostics = {
 	model?: string;
 	access: AccessMode;
 	timeoutMs?: number;
+	maxProtocolRecordChars: number;
+	oversizedProtocolRecordsSkipped: number;
 	progressTail: RecoveryProgress[];
 	droppedProgressEntries: number;
 	assistantMessageEndObserved: boolean;
@@ -825,6 +895,9 @@ function formatRecoveryDiagnostics(diagnostics: RecoveryDiagnostics): string {
 		`- assistant message_end observed: ${diagnostics.assistantMessageEndObserved ? "yes" : "no"}`,
 		"- session/log locator: unavailable (--no-session)",
 	];
+	if (diagnostics.oversizedProtocolRecordsSkipped > 0) {
+		lines.push(`- oversized protocol records skipped: ${diagnostics.oversizedProtocolRecordsSkipped} (limit: ${diagnostics.maxProtocolRecordChars} characters per record)`);
+	}
 	if (diagnostics.lastAssistantStopReason) lines.push(`- latest assistant stop reason: ${diagnostics.lastAssistantStopReason}`);
 	if (diagnostics.progressTail.length === 0) {
 		lines.push("- progress tail: no assistant progress observed");
@@ -1165,6 +1238,7 @@ async function runSubagent(
 	if (githubRead !== undefined && typeof githubRead !== "boolean") throw new Error("githubRead must be a boolean");
 	if (githubRead !== undefined && access !== "repository-read") throw new Error("githubRead is only supported with access: \"repository-read\"");
 	if (signal?.aborted) throw new Error("Subagent aborted by caller");
+	const maxProtocolRecordChars = getMaxProtocolRecordChars(process.env.PI_SUBAGENT_LITE_MAX_PROTOCOL_RECORD_CHARS);
 
 	const modelSelector = model?.trim();
 	if (modelSelector !== undefined) {
@@ -1247,7 +1321,6 @@ async function runSubagent(
 		const startedAt = Date.now();
 		const stdoutDecoder = new StringDecoder("utf8");
 		const stderrDecoder = new StringDecoder("utf8");
-		let buffer = "";
 		let stderr = "";
 		let spawnError: Error | undefined;
 		let lastAssistantText = "";
@@ -1255,7 +1328,6 @@ async function runSubagent(
 		let lastAssistantStopReason: string | undefined;
 		let assistantMessageEndObserved = false;
 		let finalAssistantResponseReceived = false;
-		let protocolOutputOverflowed = false;
 		let childExitSignal: NodeJS.Signals | null = null;
 		let turnCount = 0;
 		const progressTail: RecoveryProgress[] = [];
@@ -1302,22 +1374,8 @@ async function runSubagent(
 			}
 		};
 
-		const processStdout = (text: string) => {
-			buffer += text;
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || "";
-			for (const line of lines) {
-				if (line.length > MAX_PROTOCOL_BUFFER_LENGTH) {
-					protocolOutputOverflowed = true;
-					continue;
-				}
-				processLine(line);
-			}
-			if (buffer.length > MAX_PROTOCOL_BUFFER_LENGTH) {
-				protocolOutputOverflowed = true;
-				buffer = "";
-			}
-		};
+		const protocolLineReader = createBoundedProtocolLineReader(maxProtocolRecordChars, processLine);
+		const processStdout = (text: string) => protocolLineReader.push(text);
 		const onStdoutData = (data: Buffer) => processStdout(stdoutDecoder.write(data));
 		const onStderrData = (data: Buffer) => {
 			stderr = appendBoundedTail(stderr, stderrDecoder.write(data), MAX_STDERR_TAIL_LENGTH);
@@ -1340,6 +1398,8 @@ async function runSubagent(
 			model: modelSelector,
 			access,
 			timeoutMs,
+			maxProtocolRecordChars,
+			oversizedProtocolRecordsSkipped: protocolLineReader.getOversizedRecordCount(),
 			progressTail,
 			droppedProgressEntries,
 			assistantMessageEndObserved,
@@ -1390,7 +1450,7 @@ async function runSubagent(
 				}
 				processStdout(stdoutDecoder.end());
 				stderr = appendBoundedTail(stderr, stderrDecoder.end(), MAX_STDERR_TAIL_LENGTH);
-				if (buffer.trim()) processLine(buffer);
+				protocolLineReader.finish();
 				finish(code ?? (signal ? 1 : 0));
 			};
 			const onProcessError = (error: Error) => {
@@ -1417,13 +1477,17 @@ async function runSubagent(
 			throw new SubagentRecoveryError(`Subagent timed out after ${timeoutMs}ms`, diagnostics);
 		}
 
-		const protocolFailure = protocolOutputOverflowed
-			? new Error(`Subagent protocol output exceeded ${MAX_PROTOCOL_BUFFER_LENGTH} characters`)
+		const oversizedProtocolRecordsSkipped = protocolLineReader.getOversizedRecordCount();
+		const protocolFailure = oversizedProtocolRecordsSkipped > 0 && !finalAssistantResponseReceived
+			? new Error(`Subagent skipped ${oversizedProtocolRecordsSkipped} protocol record${oversizedProtocolRecordsSkipped === 1 ? "" : "s"} exceeding the ${maxProtocolRecordChars}-character per-record limit without receiving a valid final response`)
 			: undefined;
 		const signalFailure = childExitSignal ? new Error(`Subagent terminated by signal ${childExitSignal}`) : undefined;
+		const missingFinalResponseFailure = !finalAssistantResponseReceived
+			? new Error("Subagent exited without a valid final assistant response")
+			: undefined;
 		const failure = exitCode !== 0
 			? spawnError ?? protocolFailure ?? signalFailure ?? new Error(stderr.trim() || lastAssistantError || `Subagent exited with code ${exitCode}`)
-			: protocolFailure ?? signalFailure ?? (lastAssistantError ? new Error(lastAssistantError) : undefined);
+			: protocolFailure ?? signalFailure ?? (lastAssistantError ? new Error(lastAssistantError) : missingFinalResponseFailure);
 		if (failure) throw new SubagentRecoveryError(diagnosticDetail(failure), buildRecoveryDiagnostics("abnormal-exit"));
 
 		const report = await finishWorkspaceObservation();

@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatAssistantProgress, getMessageText, getPiInvocation, parseMessageEnd } from "../index.js";
+import {
+	createBoundedProtocolLineReader,
+	formatAssistantProgress,
+	getMaxProtocolRecordChars,
+	getMessageText,
+	getPiInvocation,
+	parseMessageEnd,
+} from "../index.js";
 
 test("parseMessageEnd only returns message_end events", () => {
 	assert.equal(parseMessageEnd(""), undefined);
@@ -9,6 +16,27 @@ test("parseMessageEnd only returns message_end events", () => {
 
 	const message = { role: "assistant", content: [{ type: "text", text: "done" }] };
 	assert.deepEqual(parseMessageEnd(JSON.stringify({ type: "message_end", message })), message);
+});
+
+test("getMaxProtocolRecordChars uses a larger default and validates overrides", () => {
+	assert.equal(getMaxProtocolRecordChars(undefined), 16 * 1024 * 1024);
+	assert.equal(getMaxProtocolRecordChars(" 2048 "), 2048);
+	for (const value of ["", "0", "-1", "1.5", "9007199254740992"]) {
+		assert.throws(() => getMaxProtocolRecordChars(value), /must be a positive safe integer/);
+	}
+});
+
+test("bounded protocol reader discards oversized records incrementally and resumes", () => {
+	const lines: string[] = [];
+	const reader = createBoundedProtocolLineReader(10, (line) => lines.push(line));
+
+	reader.push("12345");
+	reader.push("678901");
+	reader.push("discarded tail\nok\n1234567890");
+	reader.finish();
+
+	assert.deepEqual(lines, ["ok", "1234567890"]);
+	assert.equal(reader.getOversizedRecordCount(), 1);
 });
 
 test("getMessageText joins text parts and ignores other content", () => {
