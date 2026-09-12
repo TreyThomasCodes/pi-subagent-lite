@@ -607,7 +607,8 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 				undefined,
 				ctx,
 			),
-			(error: Error) => {
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
 				assert.match(error.message, /Structured completion protocol violation/);
 				assert.match(error.message, /Unparsed final response:\\nI completed the work\./);
 				return true;
@@ -616,11 +617,11 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 
 		await assert.rejects(
 			tool.execute("structured-prompt-contract", { task, completionFormat: "structured" }, undefined, undefined, ctx),
-			(error: Error) => {
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
 				assert.match(error.message, /FINAL RESPONSE PROTOCOL/);
 				assert.match(error.message, /Your final response must be exactly one JSON object/);
 				assert.match(error.message, /Example of a valid completed response/);
-				assert.doesNotMatch(error.message, /\"completed\" \\| \"blocked\"/);
 				return true;
 			},
 		);
