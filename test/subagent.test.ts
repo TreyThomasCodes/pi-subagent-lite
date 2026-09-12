@@ -240,6 +240,14 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
       assessment: { evidence: ["unvalidated"] },
       verification: { status: "not-run", checks: [] },
     }) }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_unknown_finding_") {
+    emit({ role: "assistant", content: [{ type: "text", text: JSON.stringify({
+      schemaVersion: 1,
+      status: "completed",
+      summary: "Used an undocumented finding field",
+      findings: [{ finding: "Specific defect", severity: "high" }],
+      verification: { status: "not-run", checks: [] },
+    }) }], stopReason: "stop" });
   } else {
     if (model === "_fixture_recovered_") {
       emit({ role: "assistant", content: [], stopReason: "error", errorMessage: "Transient provider failure" });
@@ -661,6 +669,17 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 				ctx,
 			),
 			/unknown top-level fields: assessment/,
+		);
+
+		await assert.rejects(
+			tool.execute(
+				"structured-unknown-finding",
+				{ task, model: "_fixture_structured_unknown_finding_", completionFormat: "structured" },
+				undefined,
+				undefined,
+				ctx,
+			),
+			/unknown finding fields: severity/,
 		);
 
 		await assert.rejects(
