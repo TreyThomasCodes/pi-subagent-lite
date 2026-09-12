@@ -610,7 +610,8 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 			(error: unknown) => {
 				assert.ok(error instanceof Error);
 				assert.match(error.message, /Structured completion protocol violation/);
-				assert.match(error.message, /Unparsed final response:\\nI completed the work\./);
+				assert.match(error.message, /Unparsed final response:/);
+				assert.match(error.message, /I completed the work\./);
 				return true;
 			},
 		);
