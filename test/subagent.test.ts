@@ -1449,19 +1449,19 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 	await t.test("renders the requested model and skill count in the header", () => {
 		const component = tool.renderCall!({ task, model: " haiku ", thinking: "high", skills: ["review", "tests"] }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[haiku\] \[thinking: high\] \+2 skills/);
+		assert.match(text, /subagent Find all test files \[workspace-write\] \[haiku high\] \+2 skills/);
 	});
 
 	await t.test("renders explicit read-only access in the header", () => {
 		const component = tool.renderCall!({ task, access: "read-only" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: read-only\]/);
+		assert.match(text, /subagent Find all test files \[read-only\]/);
 	});
 
 	await t.test("renders repository-read access and the GitHub capability in the header", () => {
 		const component = tool.renderCall!({ task, access: "repository-read", githubRead: true }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: repository-read\] \[GitHub read\]/);
+		assert.match(text, /subagent Find all test files \[repository-read\] \[GitHub read\]/);
 	});
 
 	await t.test("renders calls without a model and partial arguments", () => {
@@ -1476,19 +1476,19 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 	await t.test("renders the requested deadline and turn limit", () => {
 		const component = tool.renderCall!({ task, timeoutMs: 15_000, maxTurns: 24 }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[timeout: 15000ms\] \[max turns: 24\]/);
+		assert.match(text, /subagent Find all test files \[workspace-write\] \[timeout: 15s\] \[max turns: 24\]/);
 	});
 
 	await t.test("renders allowed-path contract counts", () => {
 		const component = tool.renderCall!({ task, allowedPaths: ["src/**", "test/*.test.ts"], pathContractMode: "strict", completionFormat: "structured" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[allowed paths: 2\] \[strict paths\] \[structured completion\]/);
+		assert.match(text, /subagent Find all test files \[workspace-write\] \[allowed paths: 2\] \[strict paths\] \[structured completion\]/);
 	});
 
 	await t.test("renders thinking without a model", () => {
 		const component = tool.renderCall!({ task, thinking: "off" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[thinking: off\]/);
+		assert.match(text, /subagent Find all test files \[workspace-write\] \[off\]/);
 		assert.doesNotMatch(text, /undefined/);
 	});
 

@@ -2141,27 +2141,36 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 
-		renderCall(args, theme, context) {
-			const task = args.task ?? "";
-			const taskPreview = task.length > 60 ? task.slice(0, 60) + "..." : task;
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("dim", taskPreview);
-			const access = args.access ?? (context.argsComplete ? DEFAULT_ACCESS_MODE : undefined);
-			if (access) text += ` ${theme.fg("accent", `[access: ${access}]`)}`;
-			const model = args.model?.trim();
-			if (model) text += ` ${theme.fg("accent", `[${model}]`)}`;
-			if (args.thinking) text += ` ${theme.fg("accent", `[thinking: ${args.thinking}]`)}`;
-			if (args.timeoutMs !== undefined) text += ` ${theme.fg("accent", `[timeout: ${args.timeoutMs}ms]`)}`;
-			if (args.maxTurns !== undefined) text += ` ${theme.fg("accent", `[max turns: ${args.maxTurns}]`)}`;
-			if (args.githubRead) text += ` ${theme.fg("accent", "[GitHub read]")}`;
-			if (args.allowedPaths !== undefined) text += ` ${theme.fg("accent", `[allowed paths: ${args.allowedPaths.length}]`)}`;
-			if (args.pathContractMode === "strict") text += ` ${theme.fg("accent", "[strict paths]")}`;
-			if (args.completionFormat === "structured") text += ` ${theme.fg("accent", "[structured completion]")}`;
-			const skillsArr = args.skills ?? [];
-			if (skillsArr.length > 0) {
-				text += ` ${theme.fg("accent", `+${skillsArr.length} skills`)}`;
-			}
-			return new Text(text, 0, 0);
-		},
+			renderCall(args, theme, context) {
+				const task = args.task ?? "";
+				const taskPreview = task.length > 60 ? task.slice(0, 60) + "..." : task;
+				let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("dim", taskPreview);
+				const access = args.access ?? (context.argsComplete ? DEFAULT_ACCESS_MODE : undefined);
+				if (access) text += ` ${theme.fg("accent", `[${access}]`)}`;
+				const model = args.model?.trim();
+				const modelAndThinking = model
+					? args.thinking
+						? `[${model} ${args.thinking}]`
+						: `[${model}]`
+					: args.thinking
+						? `[${args.thinking}]`
+						: undefined;
+				if (modelAndThinking) text += ` ${theme.fg("accent", modelAndThinking)}`;
+				if (args.timeoutMs !== undefined) {
+					const timeoutSeconds = `${args.timeoutMs / 1000}`.replace(/(\.\d*?)0+$/u, "$1").replace(/\.$/, "");
+					text += ` ${theme.fg("accent", `[timeout: ${timeoutSeconds}s]`)}`;
+				}
+				if (args.maxTurns !== undefined) text += ` ${theme.fg("accent", `[max turns: ${args.maxTurns}]`)}`;
+				if (args.githubRead) text += ` ${theme.fg("accent", "[GitHub read]")}`;
+				if (args.allowedPaths !== undefined) text += ` ${theme.fg("accent", `[allowed paths: ${args.allowedPaths.length}]`)}`;
+				if (args.pathContractMode === "strict") text += ` ${theme.fg("accent", "[strict paths]")}`;
+				if (args.completionFormat === "structured") text += ` ${theme.fg("accent", "[structured completion]")}`;
+				const skillsArr = args.skills ?? [];
+				if (skillsArr.length > 0) {
+					text += ` ${theme.fg("accent", `+${skillsArr.length} skills`)}`;
+				}
+				return new Text(text, 0, 0);
+			},
 
 		renderResult(result, options, theme, context) {
 			const output = result.content.find((c) => c.type === "text")?.text ?? "";
