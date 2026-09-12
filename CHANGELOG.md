@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Hardened structured completion with a concrete valid JSON prompt, recovery of exactly one JSON-fenced envelope surrounded by incidental prose, and bounded raw-response diagnostics when validation fails.
 - Added opt-in structured completion envelopes with validated `completed`, `blocked`, and `needs-replan` routing states plus explicit verification evidence.
 - Added `pathContractMode: "strict"` to fail a tool call when Git observation finds out-of-contract changes or cannot establish compliance, without claiming sandboxing or rollback.
 - Replaced the arbitrary 1,000,000-character protocol-record failure with a configurable 16,777,216-character default, incremental bounded parsing, accurate per-record diagnostics, recovery when a later valid final response arrives, and explicit failure for malformed output that never yields a final response.
