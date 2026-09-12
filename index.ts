@@ -615,11 +615,11 @@ function formatUnparsedCompletion(output: string): string {
 
 function parseStructuredCompletion(output: string): StructuredCompletion {
 	let candidate = output.trim();
-	const fullFence = candidate.match(/^```(?:json)?\\s*\\r?\\n([\\s\\S]*?)\\r?\\n```$/i);
+	const fullFence = candidate.match(/^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```$/i);
 	if (fullFence) {
 		candidate = fullFence[1].trim();
 	} else {
-		const jsonFences = Array.from(candidate.matchAll(/```json\\s*\\r?\\n([\\s\\S]*?)\\r?\\n```/gi));
+		const jsonFences = Array.from(candidate.matchAll(/```json\s*\r?\n([\s\S]*?)\r?\n```/gi));
 		if (jsonFences.length === 1) candidate = jsonFences[0][1].trim();
 	}
 	let parsed: unknown;
