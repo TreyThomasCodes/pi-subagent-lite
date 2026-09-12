@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added an optional mechanical `maxTurns` ceiling with process-tree cleanup, bounded recovery diagnostics, and final-response-at-limit preservation.
+- Structured completion now recovers exactly one parseable top-level JSON object embedded in incidental prose while continuing to reject schema-invalid or ambiguous objects.
+
 - Added validated optional `evidence`, `findings`, and `requiredVerification` fields to structured completions and reject undocumented top-level or finding fields.
 - Hardened structured completion with a concrete valid JSON prompt, recovery of exactly one JSON-fenced envelope surrounded by incidental prose, and bounded raw-response diagnostics when validation fails.
 - Added opt-in structured completion envelopes with validated `completed`, `blocked`, and `needs-replan` routing states plus explicit verification evidence.

@@ -20,6 +20,8 @@ const MAX_TASK_ARG_LENGTH = 4000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
 const MIN_SUBAGENT_TIMEOUT_MS = 1_000;
 const MAX_SUBAGENT_TIMEOUT_MS = 86_400_000;
+const MIN_SUBAGENT_TURNS = 1;
+const MAX_SUBAGENT_TURNS = 10_000;
 const RECOVERY_PROGRESS_LIMIT = 8;
 const RECOVERY_CLEANUP_GRACE_MS = 5_000;
 const TASKKILL_GRACE_MS = 2_000;
@@ -122,10 +124,12 @@ type WorkspaceObservation = {
 	baseline?: GitWorkspaceSnapshot;
 	initialDiagnostic?: string;
 };
+type CompletionSource = "raw-json" | "json-fence" | "embedded-json";
 type SubagentRunResult = {
 	output: string;
 	workspaceChanges?: WorkspaceChangeReport;
 	completion?: StructuredCompletion;
+	completionSource?: CompletionSource;
 };
 type VerificationCheck = {
 	command: string;
@@ -621,20 +625,80 @@ function formatUnparsedCompletion(output: string): string {
 	return `Unparsed final response:\n${truncated}`;
 }
 
-function parseStructuredCompletion(output: string): StructuredCompletion {
-	let candidate = output.trim();
-	const fullFence = candidate.match(/^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```$/i);
-	if (fullFence) {
-		candidate = fullFence[1].trim();
-	} else {
-		const jsonFences = Array.from(candidate.matchAll(/```json\s*\r?\n([\s\S]*?)\r?\n```/gi));
-		if (jsonFences.length === 1) candidate = jsonFences[0][1].trim();
+function findEmbeddedJsonObjects(output: string): string[] {
+	const candidates: string[] = [];
+	let start = -1;
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+
+	for (let index = 0; index < output.length; index++) {
+		const character = output[index];
+		if (start === -1) {
+			if (character === "{") {
+				start = index;
+				depth = 1;
+				inString = false;
+				escaped = false;
+			}
+			continue;
+		}
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (character === "\\") escaped = true;
+			else if (character === '"') inString = false;
+			continue;
+		}
+		if (character === '"') {
+			inString = true;
+			continue;
+		}
+		if (character === "{") depth++;
+		else if (character === "}") {
+			depth--;
+			if (depth === 0) {
+				const candidate = output.slice(start, index + 1);
+				try {
+					const value: unknown = JSON.parse(candidate);
+					if (value && typeof value === "object" && !Array.isArray(value)) candidates.push(candidate);
+				} catch {
+					/* not a parseable top-level JSON object */
+				}
+				start = -1;
+			}
+		}
 	}
+	return candidates;
+}
+
+function parseStructuredCompletion(output: string): { completion: StructuredCompletion; source: CompletionSource } {
+	const original = output.trim();
+	let candidate = original;
+	let source: CompletionSource = "raw-json";
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(candidate);
 	} catch {
-		throw new Error("Structured completion protocol violation: final response must be one JSON object (an optional single json code fence is accepted)");
+		const fullFence = original.match(/^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```$/i);
+		const jsonFences = fullFence ? [fullFence] : Array.from(original.matchAll(/```json\s*\r?\n([\s\S]*?)\r?\n```/gi));
+		if (jsonFences.length === 1) {
+			candidate = jsonFences[0][1].trim();
+			source = "json-fence";
+			try {
+				parsed = JSON.parse(candidate);
+			} catch {
+				parsed = undefined;
+			}
+		}
+		if (parsed === undefined) {
+			const embeddedObjects = findEmbeddedJsonObjects(original);
+			if (embeddedObjects.length !== 1) {
+				throw new Error("Structured completion protocol violation: final response must contain exactly one parseable JSON object (raw, in one json code fence, or embedded in incidental prose)");
+			}
+			candidate = embeddedObjects[0];
+			source = "embedded-json";
+			parsed = JSON.parse(candidate);
+		}
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error("Structured completion protocol violation: final response must be a JSON object");
@@ -728,7 +792,7 @@ function parseStructuredCompletion(output: string): StructuredCompletion {
 			}
 		}
 	}
-	return parsed as StructuredCompletion;
+	return { completion: parsed as StructuredCompletion, source };
 }
 
 function getMinimalSystemPrompt(
@@ -1042,7 +1106,7 @@ function terminateProcessTree(proc: ChildProcess): Promise<TerminationReport> {
 	return termination;
 }
 
-type RecoveryReason = "timeout" | "caller-abort" | "abnormal-exit";
+type RecoveryReason = "timeout" | "turn-limit" | "caller-abort" | "abnormal-exit";
 type RecoveryProgress = {
 	elapsedMs: number;
 	turn: number;
@@ -1054,6 +1118,7 @@ type RecoveryDiagnostics = {
 	model?: string;
 	access: AccessMode;
 	timeoutMs?: number;
+	maxTurns?: number;
 	maxProtocolRecordChars: number;
 	oversizedProtocolRecordsSkipped: number;
 	progressTail: RecoveryProgress[];
@@ -1074,6 +1139,7 @@ function formatRecoveryDiagnostics(diagnostics: RecoveryDiagnostics): string {
 		`- requested model: ${diagnostics.model ?? "Pi default"}`,
 		`- access: ${diagnostics.access}`,
 		`- requested deadline: ${diagnostics.timeoutMs === undefined ? "none" : `${diagnostics.timeoutMs}ms`}`,
+		`- requested turn limit: ${diagnostics.maxTurns === undefined ? "none" : diagnostics.maxTurns}`,
 		`- final child response received: ${diagnostics.finalAssistantResponseReceived ? "yes" : "no"}`,
 		`- assistant message_end observed: ${diagnostics.assistantMessageEndObserved ? "yes" : "no"}`,
 		"- session/log locator: unavailable (--no-session)",
@@ -1406,6 +1472,7 @@ async function runSubagent(
 	model?: string,
 	thinking?: ThinkingLevel,
 	timeoutMs?: number,
+	maxTurns?: number,
 	allowedPaths?: string[],
 	pathContractMode: PathContractMode = "observe",
 	completionFormat: CompletionFormat = "text",
@@ -1415,6 +1482,9 @@ async function runSubagent(
 ): Promise<SubagentRunResult> {
 	if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < MIN_SUBAGENT_TIMEOUT_MS || timeoutMs > MAX_SUBAGENT_TIMEOUT_MS)) {
 		throw new Error(`timeoutMs must be an integer between ${MIN_SUBAGENT_TIMEOUT_MS} and ${MAX_SUBAGENT_TIMEOUT_MS}`);
+	}
+	if (maxTurns !== undefined && (!Number.isInteger(maxTurns) || maxTurns < MIN_SUBAGENT_TURNS || maxTurns > MAX_SUBAGENT_TURNS)) {
+		throw new Error(`maxTurns must be an integer between ${MIN_SUBAGENT_TURNS} and ${MAX_SUBAGENT_TURNS}`);
 	}
 	const normalizedAllowedPaths = normalizeAllowedPaths(allowedPaths);
 	if (normalizedAllowedPaths !== undefined && access !== "workspace-write") {
@@ -1471,6 +1541,7 @@ async function runSubagent(
 			modelSelector && `model: ${modelSelector}`,
 			thinking && `thinking: ${thinking}`,
 			timeoutMs !== undefined && `timeout: ${timeoutMs}ms`,
+			maxTurns !== undefined && `max turns: ${maxTurns}`,
 			githubRead && "GitHub read enabled",
 			normalizedAllowedPaths !== undefined && `allowed paths: ${normalizedAllowedPaths.length}`,
 			pathContractMode === "strict" && "strict path contract",
@@ -1528,8 +1599,9 @@ async function runSubagent(
 		let droppedProgressEntries = 0;
 		let rootExitObserved = false;
 		let cleanupDeadlineExceeded = false;
-		let terminationReason: "caller-abort" | "timeout" | undefined;
+		let terminationReason: "caller-abort" | "timeout" | "turn-limit" | undefined;
 		let terminationPromise: Promise<TerminationReport> | undefined;
+		let requestTurnLimitTermination: (() => void) | undefined;
 
 		const recordProgress = (message: AgentMessage) => {
 			turnCount++;
@@ -1566,6 +1638,9 @@ async function runSubagent(
 					content: [{ type: "text", text: formatAssistantProgress(message, turnCount) }],
 				});
 			}
+			if (maxTurns !== undefined && turnCount >= maxTurns && message.stopReason === "toolUse") {
+				requestTurnLimitTermination?.();
+			}
 		};
 
 		const protocolLineReader = createBoundedProtocolLineReader(maxProtocolRecordChars, processLine);
@@ -1592,6 +1667,7 @@ async function runSubagent(
 			model: modelSelector,
 			access,
 			timeoutMs,
+			maxTurns,
 			maxProtocolRecordChars,
 			oversizedProtocolRecordsSkipped: protocolLineReader.getOversizedRecordCount(),
 			progressTail,
@@ -1607,7 +1683,7 @@ async function runSubagent(
 			let settled = false;
 			let timeoutHandle: NodeJS.Timeout | undefined;
 			let cleanupHandle: NodeJS.Timeout | undefined;
-			const terminate = (reason: "caller-abort" | "timeout") => {
+			const terminate = (reason: "caller-abort" | "timeout" | "turn-limit") => {
 				if (settled || terminationReason) return;
 				terminationReason = reason;
 				terminationPromise = terminateProcessTree(proc);
@@ -1618,12 +1694,14 @@ async function runSubagent(
 				}, RECOVERY_CLEANUP_GRACE_MS);
 				cleanupHandle.unref();
 			};
+			requestTurnLimitTermination = () => terminate("turn-limit");
 			const onAbort = () => terminate("caller-abort");
 			const finish = (code: number) => {
 				if (settled) return;
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (cleanupHandle) clearTimeout(cleanupHandle);
+				requestTurnLimitTermination = undefined;
 				signal?.removeEventListener("abort", onAbort);
 				proc.removeListener("exit", onExit);
 				proc.removeListener("close", onClose);
@@ -1668,6 +1746,7 @@ async function runSubagent(
 			const termination = await terminationPromise;
 			const diagnostics = buildRecoveryDiagnostics(terminationReason, termination);
 			if (terminationReason === "caller-abort") throw new SubagentRecoveryError("Subagent aborted by caller", diagnostics);
+			if (terminationReason === "turn-limit") throw new SubagentRecoveryError(`Subagent reached the configured turn limit of ${maxTurns}`, diagnostics);
 			throw new SubagentRecoveryError(`Subagent timed out after ${timeoutMs}ms`, diagnostics);
 		}
 
@@ -1692,16 +1771,19 @@ async function runSubagent(
 			throw new Error(`Strict allowed-path contract failed: ${reason}`);
 		}
 		let completion: StructuredCompletion | undefined;
+		let completionSource: CompletionSource | undefined;
 		if (completionFormat === "structured") {
 			try {
-				completion = parseStructuredCompletion(lastAssistantText);
+				const parsedCompletion = parseStructuredCompletion(lastAssistantText);
+				completion = parsedCompletion.completion;
+				completionSource = parsedCompletion.source;
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw new Error(`${message}\n\n${formatUnparsedCompletion(lastAssistantText)}`);
 			}
 		}
 		const resultText = completion ? JSON.stringify(completion, null, 2) : lastAssistantText;
-		return { output: appendWorkspaceChangeReport(resultText, report), workspaceChanges: report, completion };
+		return { output: appendWorkspaceChangeReport(resultText, report), workspaceChanges: report, completion, completionSource };
 	} catch (error) {
 		const report = await finishWorkspaceObservation();
 		throw appendWorkspaceChangeReportToError(error, report);
@@ -1849,6 +1931,13 @@ const SubagentParams = Type.Object({
 			maximum: MAX_SUBAGENT_TIMEOUT_MS,
 		}),
 	),
+	maxTurns: Type.Optional(
+		Type.Integer({
+			description: "Maximum assistant turns. A final response at the limit succeeds; a tool-use response at the limit terminates the child. Omit for no turn limit.",
+			minimum: MIN_SUBAGENT_TURNS,
+			maximum: MAX_SUBAGENT_TURNS,
+		}),
+	),
 	allowedPaths: Type.Optional(
 		Type.Array(Type.String({ minLength: 1, maxLength: MAX_ALLOWED_PATH_LENGTH }), {
 			description: "Optional cwd-relative path patterns for a workspace-write observational contract. Net Git changes are reported after success or failure; this is not an OS sandbox.",
@@ -1925,6 +2014,7 @@ export default function (pi: ExtensionAPI) {
 				params.model,
 				params.thinking,
 				params.timeoutMs,
+				params.maxTurns,
 				params.allowedPaths,
 				params.pathContractMode,
 				params.completionFormat,
@@ -1935,7 +2025,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: output.output || "(no output)" }],
 				details: output.workspaceChanges || output.completion
-					? { workspaceChanges: output.workspaceChanges, completion: output.completion }
+					? { workspaceChanges: output.workspaceChanges, completion: output.completion, completionSource: output.completionSource }
 					: undefined,
 			};
 		},
@@ -1950,6 +2040,7 @@ export default function (pi: ExtensionAPI) {
 			if (model) text += ` ${theme.fg("accent", `[${model}]`)}`;
 			if (args.thinking) text += ` ${theme.fg("accent", `[thinking: ${args.thinking}]`)}`;
 			if (args.timeoutMs !== undefined) text += ` ${theme.fg("accent", `[timeout: ${args.timeoutMs}ms]`)}`;
+			if (args.maxTurns !== undefined) text += ` ${theme.fg("accent", `[max turns: ${args.maxTurns}]`)}`;
 			if (args.githubRead) text += ` ${theme.fg("accent", "[GitHub read]")}`;
 			if (args.allowedPaths !== undefined) text += ` ${theme.fg("accent", `[allowed paths: ${args.allowedPaths.length}]`)}`;
 			if (args.pathContractMode === "strict") text += ` ${theme.fg("accent", "[strict paths]")}`;
