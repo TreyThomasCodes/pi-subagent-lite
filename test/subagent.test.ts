@@ -689,7 +689,9 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 				assert.match(error.message, /FINAL RESPONSE PROTOCOL/);
 				assert.match(error.message, /Your final response must be exactly one JSON object/);
 				assert.match(error.message, /Example of a valid completed response/);
-				assert.match(error.message, /"evidence".*"findings".*"requiredVerification"/s);
+				assert.match(error.message, /\\\"evidence\\\"/);
+				assert.match(error.message, /\\\"findings\\\"/);
+				assert.match(error.message, /\\\"requiredVerification\\\"/);
 				assert.match(error.message, /do not add other top-level fields/);
 				return true;
 			},
