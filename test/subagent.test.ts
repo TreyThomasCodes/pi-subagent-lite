@@ -13,7 +13,7 @@ import { Value } from "@sinclair/typebox/value";
 import registerSubagent, { classifyRepositoryReadFailure, registerRepositoryReadTools } from "../index.js";
 
 type SubagentTool = Parameters<ExtensionAPI["registerTool"]>[0];
-type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; allowedPaths?: string[]; pathContractMode?: string; completionFormat?: string; githubRead?: boolean; skills?: string[] };
+type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; maxTurns?: number; allowedPaths?: string[]; pathContractMode?: string; completionFormat?: string; githubRead?: boolean; skills?: string[] };
 const execFileAsync = promisify(execFile);
 type Invocation = { args: string[]; cwd: string; disabled: string; repositoryRead?: string; githubRead?: string; prompt: string; task: string; thinking?: string; tools?: string };
 
@@ -106,7 +106,6 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
 } else {
   if (taskSpawnFile) fs.appendFileSync(taskSpawnFile, (model || "(default)") + "\n");
   if (model === "_fixture_hanging_tree_") {
-    emit({ role: "assistant", content: [{ type: "text", text: "Starting bounded work" }], stopReason: "toolUse" });
     const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     const promptIndex = args.indexOf("--append-system-prompt");
     fs.writeFileSync(process.env.PI_SUBAGENT_TEST_PID_FILE, JSON.stringify({
@@ -114,6 +113,7 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
       rootPid: process.pid,
       promptFile: promptIndex >= 0 ? args[promptIndex + 1] : undefined,
     }));
+    emit({ role: "assistant", content: [{ type: "text", text: "Starting bounded work" }], stopReason: "toolUse" });
     setInterval(() => {}, 1000);
   } else if (model === "_fixture_error_then_hang_") {
     emit({ role: "assistant", content: [{ type: "text", text: "Earlier terminal error must not be treated as final" }], stopReason: "error", errorMessage: "Transient provider failure" });
@@ -206,6 +206,26 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
       summary: "Implemented despite incidental prose",
       verification: { status: "passed", checks: [{ command: "npm test", status: "passed", evidence: "42 tests passed" }] },
     }) + '\n' + fence + "\n\nAdditional explanation." }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_embedded_") {
+    emit({ role: "assistant", content: [{ type: "text", text: "All changes are complete and verified. Final report:\n\n" + JSON.stringify({
+      schemaVersion: 1,
+      status: "completed",
+      summary: "Recovered one embedded completion",
+      verification: { status: "passed", checks: [{ command: "npm test", status: "passed", evidence: "42 tests passed" }] },
+    }) }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_embedded_ambiguous_") {
+    const first = JSON.stringify({ schemaVersion: 1, status: "completed", summary: "First", verification: { status: "not-run", checks: [] } });
+    const second = JSON.stringify({ schemaVersion: 1, status: "completed", summary: "Second", verification: { status: "not-run", checks: [] } });
+    emit({ role: "assistant", content: [{ type: "text", text: "First: " + first + "\nSecond: " + second }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_embedded_invalid_schema_") {
+    emit({ role: "assistant", content: [{ type: "text", text: "Work is complete.\n\n" + JSON.stringify({
+      schemaVersion: 1,
+      status: "completed",
+      summary: "Includes untrusted child path claims",
+      changedPaths: ["src/example.ts"],
+      blocker: "",
+      verification: { status: "passed", checks: [{ command: "npm test", status: "passed" }] },
+    }) }], stopReason: "stop" });
   } else if (model === "_fixture_structured_replan_") {
     const fence = String.fromCharCode(96).repeat(3);
     emit({ role: "assistant", content: [{ type: "text", text: fence + 'json\n' + JSON.stringify({
@@ -489,6 +509,8 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 		assert.equal(Value.Check(schema, { task, access: "write" }), false);
 		assert.equal(Value.Check(schema, { task, timeoutMs: 1_000 }), true);
 		assert.equal(Value.Check(schema, { task, timeoutMs: 86_400_000 }), true);
+		assert.equal(Value.Check(schema, { task, maxTurns: 1 }), true);
+		assert.equal(Value.Check(schema, { task, maxTurns: 10_000 }), true);
 		assert.equal(Value.Check(schema, { task, allowedPaths: ["src/**", "README.md"] }), true);
 		assert.equal(Value.Check(schema, { task, allowedPaths: [] }), true);
 		assert.equal(Value.Check(schema, { task, allowedPaths: ["src/**"], pathContractMode: "strict" }), true);
@@ -500,6 +522,9 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 		assert.equal(Value.Check(schema, { task, allowedPaths: "src/**" }), false);
 		for (const timeoutMs of [999, 86_400_001, 1_000.5, "1000", null]) {
 			assert.equal(Value.Check(schema, { task, timeoutMs }), false, `invalid timeout: ${JSON.stringify(timeoutMs)}`);
+		}
+		for (const maxTurns of [0, 10_001, 1.5, "1", null]) {
+			assert.equal(Value.Check(schema, { task, maxTurns }), false, `invalid maxTurns: ${JSON.stringify(maxTurns)}`);
 		}
 		for (const model of ["", " \t\n", 42, null, [], {}]) {
 			assert.equal(Value.Check(schema, { task, model }), false, `invalid model: ${JSON.stringify(model)}`);
@@ -609,6 +634,40 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 		const proseFencedDetails = proseFenced.details as { completion?: { status: string; summary: string } } | undefined;
 		assert.equal(proseFencedDetails?.completion?.status, "completed");
 		assert.match(proseFencedDetails?.completion?.summary ?? "", /incidental prose/);
+
+		const embedded = await tool.execute(
+			"structured-embedded",
+			{ task, model: "_fixture_structured_embedded_", completionFormat: "structured" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const embeddedDetails = embedded.details as { completion?: { status: string; summary: string }; completionSource?: string } | undefined;
+		assert.equal(embeddedDetails?.completion?.status, "completed");
+		assert.match(embeddedDetails?.completion?.summary ?? "", /embedded completion/);
+		assert.equal(embeddedDetails?.completionSource, "embedded-json");
+
+		await assert.rejects(
+			tool.execute(
+				"structured-embedded-ambiguous",
+				{ task, model: "_fixture_structured_embedded_ambiguous_", completionFormat: "structured" },
+				undefined,
+				undefined,
+				ctx,
+			),
+			/exactly one parseable JSON object/,
+		);
+
+		await assert.rejects(
+			tool.execute(
+				"structured-embedded-invalid-schema",
+				{ task, model: "_fixture_structured_embedded_invalid_schema_", completionFormat: "structured" },
+				undefined,
+				undefined,
+				ctx,
+			),
+			/unknown top-level fields: changedPaths/,
+		);
 
 		const replan = await tool.execute(
 			"structured-replan",
@@ -1250,6 +1309,34 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 		await invoke({ task, access: "workspace-write" });
 	});
 
+	await t.test("enforces a turn limit, reports recovery evidence, and preserves a final response at the limit", async () => {
+		const finalAtLimit = await invoke({ task, maxTurns: 1 });
+		assert.equal(finalAtLimit.task, task);
+
+		await rm(pidFile, { force: true });
+		const rejection = assert.rejects(
+			tool.execute("turn-limit-test", { task, model: "_fixture_hanging_tree_", maxTurns: 1, allowedPaths: ["src/**"] }, undefined, undefined, contractCtx),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^Subagent reached the configured turn limit of 1/);
+				assert.match(error.message, /- reason: turn-limit/);
+				assert.match(error.message, /- requested deadline: none/);
+				assert.match(error.message, /- requested turn limit: 1/);
+				assert.match(error.message, /progress tail: last 1 entry\n  - \+\d+ms Turn 1: thinking\.\.\./);
+				assert.match(error.message, /root process exit observed: yes/);
+				assert.match(error.message, process.platform === "win32" ? /taskkill completed \(exit 0\)/ : /process-group requested/);
+				assert.match(error.message, /Workspace change report \(observational\):[\s\S]*status: available/);
+				return true;
+			},
+		);
+		const { pid, rootPid, promptFile } = await readDescendantState();
+		await rejection;
+		await waitForProcessExit(pid);
+		await waitForProcessExit(rootPid);
+		await assert.rejects(access(promptFile));
+		await invoke({ task, access: "workspace-write" });
+	});
+
 	await t.test("times out a progressing child, reports bounded recovery evidence, and terminates its process tree", async () => {
 		await rm(pidFile, { force: true });
 		const updates: AgentToolResult[] = [];
@@ -1350,10 +1437,10 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 		}
 	});
 
-	await t.test("renders the requested deadline", () => {
-		const component = tool.renderCall!({ task, timeoutMs: 15_000 }, theme, renderContext);
+	await t.test("renders the requested deadline and turn limit", () => {
+		const component = tool.renderCall!({ task, timeoutMs: 15_000, maxTurns: 24 }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[timeout: 15000ms\]/);
+		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[timeout: 15000ms\] \[max turns: 24\]/);
 	});
 
 	await t.test("renders allowed-path contract counts", () => {
