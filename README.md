@@ -27,7 +27,7 @@ Lightweight delegation without agent definition files or a separate configuratio
 - **Model discovery**: Get the isolated child's live model catalog, including selectors, capabilities, token limits, thinking levels, and configured cost metadata
 - **Per-call access modes**: Enforce a `read-only` Pi tool allowlist or preserve normal tools with `workspace-write`
 - **Preflighted model selection**: Choose a different model for each subagent with Pi's native `--model` selectors, validated before the task child starts
-- **Bounded runtime**: Optionally cap a child run, terminate its process tree, and return bounded recovery evidence on timeout or caller cancellation
+- **Bounded execution**: Optionally cap child runtime and assistant turns, terminate its process tree, and return bounded recovery evidence on timeout, turn limit, or caller cancellation
 - **Resilient protocol parsing**: Accept large Pi JSONL records while incrementally bounding malformed, unterminated output
 - **Workspace-write coordination**: Reject concurrent writers targeting the same working directory while preserving parallel read-only work
 - **Optional skills**: Preload capabilities via `--skill` flags
@@ -197,7 +197,7 @@ Evidence-bearing analysis and review may add these optional fields:
 
 Each optional array must be non-empty when present. A finding requires `finding`; `path` and `smallestCorrection` are optional. Unknown top-level and finding fields are rejected so the documented envelope and validator cannot drift. Ordinary implementation workers may omit all three evidence-bearing fields.
 
-The default remains `text`. Structured completion is an LLM response protocol rather than a correctness guarantee. The child receives a concrete valid JSON example and is told to return raw JSON only. As a compatibility recovery, the extension also accepts exactly one valid `json` code fence surrounded by incidental prose; absent or ambiguous JSON remains a protocol failure. Failure diagnostics include a bounded copy of the unparsed final response so the parent can recover without silently inferring completion. The parent must still review the evidence and workspace state.
+The default remains `text`. Structured completion is an LLM response protocol rather than a correctness guarantee. The child receives a concrete valid JSON example and is told to return raw JSON only. As compatibility recovery, the extension accepts either exactly one valid `json` code fence or exactly one parseable top-level JSON object embedded in incidental prose. The recovery source is exposed as `details.completionSource` (`raw-json`, `json-fence`, or `embedded-json`). Normal schema validation still applies after extraction: undocumented fields, invalid status combinations, malformed objects, and multiple candidate objects remain protocol failures. Failure diagnostics include a bounded copy of the unparsed final response so the parent can recover without silently inferring completion. The parent must still review the evidence and workspace state.
 
 ### Setting a deadline
 
@@ -208,6 +208,12 @@ A deadline failure reports `Subagent timed out after ...` separately from caller
 On timeout or cancellation, the extension terminates the Pi process tree using a detached process group on Unix-like platforms and Windows `taskkill /T` on Windows. It records the termination request or helper outcome, waits for the root process to close for a bounded grace period, and warns if the root may still be running. The child does not expose a descendant-PID inventory, so recovery diagnostics explicitly report descendant verification as unavailable; a submitted tree kill is evidence of an attempt, not an operating-system sandbox or proof that every descendant is gone. Temporary prompt/task files and deadline listeners are still cleaned up.
 
 This is an overall child runtime cap, not a project-specific test-command policy. After a timeout or cancellation, inspect the recovery block, verify workspace changes and any suspected survivors, and run project checks before starting another writer. Put narrower command timeouts in the delegated task or project tooling when needed.
+
+### Limiting assistant turns
+
+Set `maxTurns` to an integer from `1` through `10000` to bound assistant `message_end` turns inside one child invocation. A final response delivered at the limit succeeds. If the assistant requests another tool at the limit, the extension terminates the process tree and reports `reason: turn-limit` with the same bounded recovery and workspace-change diagnostics used for deadlines and cancellation.
+
+The option is mechanical scope control, not a quality judgment or token budget. It complements `timeoutMs`: a child can still hang inside one long-running tool call before producing another assistant turn, so callers should normally set both. When omitted, no turn limit is imposed for compatibility.
 
 ### Configuring large protocol records
 
@@ -255,6 +261,7 @@ Or specify it in a `subagent` tool call, with or without skills:
 | `model` | `string` | No | A Pi selector, preferably one returned by `subagent_models`; preflighted with the same child Pi executable before passing it via `--model`; omitted uses the child Pi process's normal model selection |
 | `thinking` | `"off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | No | Child thinking level, passed via `--thinking` and displayed beside the model |
 | `timeoutMs` | `integer` | No | Maximum child runtime in milliseconds, from `1000` through `86400000`; omitted means no extension-imposed deadline |
+| `maxTurns` | `integer` | No | Maximum assistant turns, from `1` through `10000`; a final response at the limit succeeds and a tool-use response at the limit terminates the child |
 | `allowedPaths` | `string[]` | No | Cwd-relative glob-like patterns observed for net Git changes; workspace-write only. Reports violations but does not sandbox or revert them. |
 | `pathContractMode` | `"observe" \| "strict"` | No | Defaults to `observe`. `strict` fails when the observed contract is violated or unknown; it still does not sandbox or revert writes. |
 | `completionFormat` | `"text" \| "structured"` | No | Defaults to `text`. `structured` validates and returns a routing-oriented completion envelope in `details.completion`. |
