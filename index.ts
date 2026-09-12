@@ -132,6 +132,11 @@ type VerificationCheck = {
 	status: VerificationStatus;
 	evidence?: string;
 };
+type CompletionFinding = {
+	path?: string;
+	finding: string;
+	smallestCorrection?: string;
+};
 type StructuredCompletion = {
 	schemaVersion: 1;
 	status: CompletionStatus;
@@ -142,6 +147,9 @@ type StructuredCompletion = {
 	};
 	blocker?: string;
 	uncertainty?: string;
+	evidence?: string[];
+	findings?: CompletionFinding[];
+	requiredVerification?: string[];
 };
 
 function normalizeAllowedPaths(allowedPaths: string[] | undefined): string[] | undefined {
@@ -632,6 +640,21 @@ function parseStructuredCompletion(output: string): StructuredCompletion {
 		throw new Error("Structured completion protocol violation: final response must be a JSON object");
 	}
 	const value = parsed as Record<string, unknown>;
+	const allowedFields = new Set([
+		"schemaVersion",
+		"status",
+		"summary",
+		"verification",
+		"blocker",
+		"uncertainty",
+		"evidence",
+		"findings",
+		"requiredVerification",
+	]);
+	const unknownFields = Object.keys(value).filter((field) => !allowedFields.has(field));
+	if (unknownFields.length > 0) {
+		throw new Error(`Structured completion protocol violation: unknown top-level fields: ${unknownFields.join(", ")}`);
+	}
 	if (value.schemaVersion !== 1 || !COMPLETION_STATUSES.includes(value.status as CompletionStatus) || typeof value.summary !== "string" || !value.summary.trim()) {
 		throw new Error("Structured completion protocol violation: schemaVersion, status, or summary is invalid");
 	}
@@ -676,6 +699,35 @@ function parseStructuredCompletion(output: string): StructuredCompletion {
 	if (value.status === "completed" && value.blocker !== undefined) {
 		throw new Error("Structured completion protocol violation: completed status cannot include a blocker");
 	}
+	for (const field of ["evidence", "requiredVerification"] as const) {
+		const entries = value[field];
+		if (entries !== undefined && (!Array.isArray(entries) || entries.length === 0 || entries.some((entry) => typeof entry !== "string" || !entry.trim()))) {
+			throw new Error(`Structured completion protocol violation: ${field} must be a non-empty array of non-empty strings when present`);
+		}
+	}
+	if (value.findings !== undefined) {
+		if (!Array.isArray(value.findings) || value.findings.length === 0) {
+			throw new Error("Structured completion protocol violation: findings must be a non-empty array when present");
+		}
+		for (const finding of value.findings) {
+			if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
+				throw new Error("Structured completion protocol violation: each finding must be an object");
+			}
+			const findingValue = finding as Record<string, unknown>;
+			const unknownFindingFields = Object.keys(findingValue).filter((field) => !["path", "finding", "smallestCorrection"].includes(field));
+			if (unknownFindingFields.length > 0) {
+				throw new Error(`Structured completion protocol violation: unknown finding fields: ${unknownFindingFields.join(", ")}`);
+			}
+			if (typeof findingValue.finding !== "string" || !findingValue.finding.trim()) {
+				throw new Error("Structured completion protocol violation: each finding requires a non-empty finding");
+			}
+			for (const field of ["path", "smallestCorrection"] as const) {
+				if (findingValue[field] !== undefined && (typeof findingValue[field] !== "string" || !findingValue[field].trim())) {
+					throw new Error(`Structured completion protocol violation: finding ${field} must be a non-empty string when present`);
+				}
+			}
+		}
+	}
 	return parsed as StructuredCompletion;
 }
 
@@ -708,6 +760,11 @@ Allowed verification status values: passed, failed, not-run.
 When no verification command was run, use "verification":{"status":"not-run","checks":[]}.
 Include a non-empty "blocker" when status is blocked or needs-replan.
 The optional "uncertainty" field must be a string when present.
+For evidence-bearing analysis or review, you may also include these optional fields:
+- "evidence": ["observed fact"]
+- "findings": [{"path":"optional/file:line","finding":"specific defect or counterexample","smallestCorrection":"optional bounded correction"}]
+- "requiredVerification": ["exact next check"]
+Each optional array must be non-empty when present. Do not nest evidence under an "assessment" object and do not add other top-level fields.
 Use blocked for an environmental, tool, or external-dependency impediment that does not invalidate the task packet.
 Use needs-replan when the supplied scope, contract, allowed paths, or dependencies are insufficient or contradictory and require parent judgment.
 Use completed only when the requested implementation or analysis is done. Verification is independent and must report only checks actually run.
