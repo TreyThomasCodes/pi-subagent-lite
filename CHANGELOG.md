@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added validated optional `evidence`, `findings`, and `requiredVerification` fields to structured completions and reject undocumented top-level or finding fields.
 - Hardened structured completion with a concrete valid JSON prompt, recovery of exactly one JSON-fenced envelope surrounded by incidental prose, and bounded raw-response diagnostics when validation fails.
 - Added opt-in structured completion envelopes with validated `completed`, `blocked`, and `needs-replan` routing states plus explicit verification evidence.
 - Added `pathContractMode: "strict"` to fail a tool call when Git observation finds out-of-contract changes or cannot establish compliance, without claiming sandboxing or rollback.
