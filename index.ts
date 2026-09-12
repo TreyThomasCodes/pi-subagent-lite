@@ -26,6 +26,7 @@ const TASKKILL_GRACE_MS = 2_000;
 const MAX_DIAGNOSTIC_DETAIL_LENGTH = 240;
 const DEFAULT_MAX_PROTOCOL_RECORD_CHARS = 16 * 1024 * 1024;
 const MAX_STDERR_TAIL_LENGTH = 4_000;
+const MAX_COMPLETION_DIAGNOSTIC_LENGTH = 4_000;
 const MAX_ALLOWED_PATHS = 100;
 const MAX_ALLOWED_PATH_LENGTH = 512;
 const MAX_GIT_OUTPUT_BYTES = 4_000_000;
@@ -603,10 +604,24 @@ function appendWorkspaceChangeReportToError(error: unknown, report: WorkspaceCha
 	return new Error(`${message}\n\n${formatWorkspaceChangeReport(report)}`);
 }
 
+function formatUnparsedCompletion(output: string): string {
+	const normalized = output.trim();
+	if (!normalized) return "Unparsed final response: (empty)";
+	const truncated = normalized.length > MAX_COMPLETION_DIAGNOSTIC_LENGTH
+		? `${normalized.slice(0, MAX_COMPLETION_DIAGNOSTIC_LENGTH)}\n...[truncated ${normalized.length - MAX_COMPLETION_DIAGNOSTIC_LENGTH} characters]`
+		: normalized;
+	return `Unparsed final response:\n${truncated}`;
+}
+
 function parseStructuredCompletion(output: string): StructuredCompletion {
 	let candidate = output.trim();
-	const fenced = candidate.match(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i);
-	if (fenced) candidate = fenced[1].trim();
+	const fullFence = candidate.match(/^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```$/i);
+	if (fullFence) {
+		candidate = fullFence[1].trim();
+	} else {
+		const jsonFences = Array.from(candidate.matchAll(/```json\s*\r?\n([\s\S]*?)\r?\n```/gi));
+		if (jsonFences.length === 1) candidate = jsonFences[0][1].trim();
+	}
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(candidate);
@@ -680,7 +695,23 @@ function getMinimalSystemPrompt(
 		? `\nA ${pathContractMode === "strict" ? "strict parent-side acceptance" : "observational"} allowed-path contract applies: ${allowedPaths.map((value) => JSON.stringify(value)).join(", ") || "no changes are allowed"}. Keep edits within that contract. The parent reports net observed Git changes after the run; this is not a sandbox and does not undo edits.${pathContractMode === "strict" ? " The tool call fails after the run if observation finds an out-of-contract path or cannot establish compliance." : ""}\n`
 		: "";
 	const completionGuidance = completionFormat === "structured"
-		? `\nYour final response must contain only this JSON object (a single json code fence is tolerated):\n{\n  "schemaVersion": 1,\n  "status": "completed" | "blocked" | "needs-replan",\n  "summary": "concise result",\n  "verification": {\n    "status": "passed" | "failed" | "not-run",\n    "checks": [{ "command": "exact command", "status": "passed" | "failed" | "not-run", "evidence": "concise outcome" }]\n  },\n  "blocker": "required when blocked or needs-replan",\n  "uncertainty": "optional material uncertainty"\n}\nUse blocked for an environmental, tool, or external-dependency impediment that does not invalidate the task packet. Use needs-replan when the supplied scope, contract, allowed paths, or dependencies are insufficient or contradictory and require parent judgment. Use completed only when the requested implementation or analysis is done; verification is reported independently and must reflect checks actually run. Omit optional fields rather than inventing content.\n`
+		? `\nFINAL RESPONSE PROTOCOL
+
+Your final response must be exactly one JSON object. Do not include Markdown, a code fence, a preface, or trailing explanation.
+
+Example of a valid completed response:
+
+{"schemaVersion":1,"status":"completed","summary":"Implemented the bounded task.","verification":{"status":"passed","checks":[{"command":"npm test","status":"passed","evidence":"42 tests passed."}]}}
+
+Allowed status values: completed, blocked, needs-replan.
+Allowed verification status values: passed, failed, not-run.
+When no verification command was run, use "verification":{"status":"not-run","checks":[]}.
+Include a non-empty "blocker" when status is blocked or needs-replan.
+The optional "uncertainty" field must be a string when present.
+Use blocked for an environmental, tool, or external-dependency impediment that does not invalidate the task packet.
+Use needs-replan when the supplied scope, contract, allowed paths, or dependencies are insufficient or contradictory and require parent judgment.
+Use completed only when the requested implementation or analysis is done. Verification is independent and must report only checks actually run.
+Omit optional fields rather than assigning null. Before sending the response, ensure it is valid JSON.\n`
 		: "";
 
 	return `You are a subagent running in an isolated pi process.
@@ -1603,7 +1634,15 @@ async function runSubagent(
 				: "workspace observation could not establish compliance";
 			throw new Error(`Strict allowed-path contract failed: ${reason}`);
 		}
-		const completion = completionFormat === "structured" ? parseStructuredCompletion(lastAssistantText) : undefined;
+		let completion: StructuredCompletion | undefined;
+		if (completionFormat === "structured") {
+			try {
+				completion = parseStructuredCompletion(lastAssistantText);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				throw new Error(`${message}\n\n${formatUnparsedCompletion(lastAssistantText)}`);
+			}
+		}
 		const resultText = completion ? JSON.stringify(completion, null, 2) : lastAssistantText;
 		return { output: appendWorkspaceChangeReport(resultText, report), workspaceChanges: report, completion };
 	} catch (error) {

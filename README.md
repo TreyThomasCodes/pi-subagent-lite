@@ -179,7 +179,7 @@ Set `completionFormat` to `structured` when an orchestrator needs to route the r
 
 Completion `status` is `completed`, `blocked`, or `needs-replan`. `blocked` means an environmental, tool, or external-dependency impediment left an otherwise valid task unfinished. `needs-replan` means the supplied scope, contract, allowed paths, or dependencies require parent judgment. Both require a non-empty `blocker`. Verification is independent and reports `passed`, `failed`, or `not-run`, with the exact checks actually attempted.
 
-The default remains `text`. Structured completion is an LLM response protocol rather than a correctness guarantee: the extension rejects malformed or internally inconsistent envelopes, but the parent must still review the evidence and workspace state.
+The default remains `text`. Structured completion is an LLM response protocol rather than a correctness guarantee. The child receives a concrete valid JSON example and is told to return raw JSON only. As a compatibility recovery, the extension also accepts exactly one valid `json` code fence surrounded by incidental prose; absent or ambiguous JSON remains a protocol failure. Failure diagnostics include a bounded copy of the unparsed final response so the parent can recover without silently inferring completion. The parent must still review the evidence and workspace state.
 
 ### Setting a deadline
 
