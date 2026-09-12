@@ -1464,6 +1464,8 @@ async function validateModelSelector(cwd: string, modelSelector: string, signal?
 	}
 }
 
+type SubagentMessageEndCallback = (turnCount: number, usage: unknown) => void;
+
 async function runSubagent(
 	cwd: string,
 	task: string,
@@ -1479,6 +1481,7 @@ async function runSubagent(
 	githubRead?: boolean,
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult) => void,
+	onAssistantMessageEnd?: SubagentMessageEndCallback,
 ): Promise<SubagentRunResult> {
 	if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < MIN_SUBAGENT_TIMEOUT_MS || timeoutMs > MAX_SUBAGENT_TIMEOUT_MS)) {
 		throw new Error(`timeoutMs must be an integer between ${MIN_SUBAGENT_TIMEOUT_MS} and ${MAX_SUBAGENT_TIMEOUT_MS}`);
@@ -1633,6 +1636,7 @@ async function runSubagent(
 			if (text && !lastAssistantError) lastAssistantText = text;
 
 			recordProgress(message);
+			onAssistantMessageEnd?.(turnCount, (message as { usage?: unknown }).usage);
 			if (onUpdate) {
 				onUpdate({
 					content: [{ type: "text", text: formatAssistantProgress(message, turnCount) }],
@@ -1900,6 +1904,68 @@ export function registerRepositoryReadTools(pi: ExtensionAPI, enableGitHubRead =
 	});
 }
 
+type SubagentStatusUsage = {
+	totalTokens: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	hasUsage: boolean;
+	hasOutput: boolean;
+	isPartial: boolean;
+};
+
+type ActiveSubagentStatus = {
+	id: symbol;
+	startedAt: number;
+	turnCount: number;
+	usage: SubagentStatusUsage;
+	setStatus: (text?: string) => void;
+};
+
+function validTokenCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function recordSubagentUsage(usage: SubagentStatusUsage, value: unknown): void {
+	if (!value || typeof value !== "object") return;
+	const record = value as Record<string, unknown>;
+	const input = validTokenCount(record.input);
+	const output = validTokenCount(record.output);
+	const cacheRead = validTokenCount(record.cacheRead);
+	const cacheWrite = validTokenCount(record.cacheWrite);
+	const total = validTokenCount(record.totalTokens);
+	const components = [input, output, cacheRead, cacheWrite];
+	const presentComponents = components.filter((component): component is number => component !== undefined);
+	if (total === undefined && presentComponents.length === 0) return;
+
+	usage.hasUsage = true;
+	usage.totalTokens += total ?? presentComponents.reduce((sum, component) => sum + component, 0);
+	if (input !== undefined) usage.inputTokens += input;
+	if (output !== undefined) {
+		usage.outputTokens += output;
+		usage.hasOutput = true;
+	}
+	if (cacheRead !== undefined) usage.cacheReadTokens += cacheRead;
+	if (cacheWrite !== undefined) usage.cacheWriteTokens += cacheWrite;
+	if (total === undefined && presentComponents.length < components.length) usage.isPartial = true;
+}
+
+function formatSubagentStatus(status: ActiveSubagentStatus, activeCount: number): string {
+	const elapsedMs = Math.max(0, Date.now() - status.startedAt);
+	const elapsedSeconds = Math.floor(elapsedMs / 1_000);
+	const turns = `${status.turnCount} turn${status.turnCount === 1 ? "" : "s"}`;
+	let text = `Subagent ${elapsedSeconds}s · ${turns} · ${activeCount} active`;
+	if (!status.usage.hasUsage) return text;
+
+	text += ` · ${status.usage.totalTokens} ${status.usage.isPartial ? "reported " : ""}tokens`;
+	if (status.usage.hasOutput) {
+		text += ` · ${status.usage.outputTokens} output`;
+		if (elapsedMs > 0) text += ` (${(status.usage.outputTokens / (elapsedMs / 1_000)).toFixed(1)}/s)`;
+	}
+	return text;
+}
+
 const SubagentParams = Type.Object({
 	task: Type.String({ description: "Bounded delegation task. For non-trivial work, state the objective, scope, access expectations, exclusions, verification, stopping conditions, and requested report format." }),
 	model: Type.Optional(
@@ -1970,6 +2036,17 @@ export default function (pi: ExtensionAPI) {
 		return;
 	}
 
+	const activeStatuses = new Map<symbol, ActiveSubagentStatus>();
+	const updateFooter = () => {
+		const current = Array.from(activeStatuses.values()).at(-1);
+		if (current) current.setStatus(formatSubagentStatus(current, activeStatuses.size));
+	};
+	const clearFooter = (status: ActiveSubagentStatus) => {
+		activeStatuses.delete(status.id);
+		if (activeStatuses.size === 0) status.setStatus();
+		else updateFooter();
+	};
+
 	pi.registerTool({
 		name: "subagent_models",
 		label: "Subagent Models",
@@ -2005,29 +2082,63 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			// Pi marks thrown errors as failed tool results; returning isError does not.
-			const output = await runSubagent(
-				ctx.cwd,
-				params.task,
-				params.skills ?? [],
-				params.access ?? DEFAULT_ACCESS_MODE,
-				params.model,
-				params.thinking,
-				params.timeoutMs,
-				params.maxTurns,
-				params.allowedPaths,
-				params.pathContractMode,
-				params.completionFormat,
-				params.githubRead,
-				signal,
-				onUpdate,
-			);
-			return {
-				content: [{ type: "text", text: output.output || "(no output)" }],
-				details: output.workspaceChanges || output.completion
-					? { workspaceChanges: output.workspaceChanges, completion: output.completion, completionSource: output.completionSource }
-					: undefined,
-			};
+			const status = ctx.hasUI
+				? {
+					id: Symbol("subagent-status"),
+					startedAt: Date.now(),
+					turnCount: 0,
+					usage: { totalTokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, hasUsage: false, hasOutput: false, isPartial: false },
+					setStatus: (text?: string) => {
+						try {
+							ctx.ui?.setStatus("subagent", text);
+						} catch {
+							/* UI status is best effort. */
+						}
+					},
+				}
+				: undefined;
+			let statusTimer: NodeJS.Timeout | undefined;
+			try {
+				if (status) {
+					activeStatuses.set(status.id, status);
+					updateFooter();
+					statusTimer = setInterval(updateFooter, 1_000);
+					statusTimer.unref();
+				}
+
+				// Pi marks thrown errors as failed tool results; returning isError does not.
+				const output = await runSubagent(
+					ctx.cwd,
+					params.task,
+					params.skills ?? [],
+					params.access ?? DEFAULT_ACCESS_MODE,
+					params.model,
+					params.thinking,
+					params.timeoutMs,
+					params.maxTurns,
+					params.allowedPaths,
+					params.pathContractMode,
+					params.completionFormat,
+					params.githubRead,
+					signal,
+					onUpdate,
+					(turnCount, usage) => {
+						if (!status) return;
+						status.turnCount = turnCount;
+						recordSubagentUsage(status.usage, usage);
+						updateFooter();
+					},
+				);
+				return {
+					content: [{ type: "text", text: output.output || "(no output)" }],
+					details: output.workspaceChanges || output.completion
+						? { workspaceChanges: output.workspaceChanges, completion: output.completion, completionSource: output.completionSource }
+						: undefined,
+				};
+			} finally {
+				if (statusTimer) clearInterval(statusTimer);
+				if (status) clearFooter(status);
+			}
 		},
 
 		renderCall(args, theme, context) {
