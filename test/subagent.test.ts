@@ -177,6 +177,12 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
     const staged = spawnSync("git", ["add", "tracked.ts"]);
     if (staged.status !== 0) throw new Error("Could not stage fixture change");
     emit({ role: "assistant", content: [{ type: "text", text: "Staged a tracked file" }], stopReason: "stop" });
+  } else if (model === "_fixture_status_usage_") {
+    emit({ role: "assistant", content: [], stopReason: "toolUse", usage: { input: 10, output: 0 } });
+    setTimeout(() => emit({ role: "assistant", content: [{ type: "text", text: "Reported usage complete" }], stopReason: "stop", usage: { input: 2, output: 4, cacheRead: 1, cacheWrite: 3 } }), 1_100);
+  } else if (model === "_fixture_status_short_" || model === "_fixture_status_long_") {
+    const wait = model === "_fixture_status_short_" ? 100 : 300;
+    setTimeout(() => emit({ role: "assistant", content: [{ type: "text", text: "Status fixture complete" }], stopReason: "stop" }), wait);
   } else if (model === "_fixture_structured_completed_") {
     emit({ role: "assistant", content: [{ type: "text", text: JSON.stringify({
       schemaVersion: 1,
@@ -351,8 +357,8 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 	assert.ok(tool);
 	assert.ok(modelsTool);
 	const parentModel = Object.freeze({ provider: "parent-provider", id: "parent-model" });
-	const ctx = Object.freeze({ cwd: fixtureDir, hasUI: false, model: parentModel });
-	const contractCtx = Object.freeze({ cwd: contractWorkspace, hasUI: false, model: parentModel });
+	const ctx = Object.freeze({ cwd: fixtureDir, hasUI: false, ui: { setStatus: () => {} }, model: parentModel });
+	const contractCtx = Object.freeze({ cwd: contractWorkspace, hasUI: false, ui: { setStatus: () => {} }, model: parentModel });
 	const task = "Find all test files";
 	const isProcessRunning = (pid: number) => {
 		try {
@@ -490,6 +496,36 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 		assert.ok(changes, "allowedPaths results include structured workspace changes");
 		return changes;
 	};
+
+	await t.test("reports UI footer status through completion without affecting headless calls", async () => {
+		const statuses: Array<string | undefined> = [];
+		const uiCtx = { ...ctx, hasUI: true, ui: { setStatus: (_key: string, text?: string) => statuses.push(text) } };
+		const running = tool.execute("status-usage", { task, model: "_fixture_status_usage_", access: "read-only" }, undefined, undefined, uiCtx);
+		assert.match(statuses[0] ?? "", /^Subagent 0s · 0 turns · 1 active$/);
+		await running;
+		assert.ok(statuses.some((text) => /1 turn · 1 active · 10 reported tokens · 0 output/.test(text ?? "")));
+		assert.ok(statuses.some((text) => /20 reported tokens · 4 output \([\d.]+\/s\)/.test(text ?? "")));
+		assert.equal(statuses.at(-1), undefined);
+
+		const headlessStatuses: Array<string | undefined> = [];
+		await tool.execute("status-headless", { task, access: "read-only" }, undefined, undefined, {
+			...ctx,
+			ui: { setStatus: (_key: string, text?: string) => headlessStatuses.push(text) },
+		});
+		assert.deepEqual(headlessStatuses, []);
+	});
+
+	await t.test("keeps a surviving overlapping read-only call visible", async () => {
+		const statuses: Array<string | undefined> = [];
+		const uiCtx = { ...ctx, hasUI: true, ui: { setStatus: (_key: string, text?: string) => statuses.push(text) } };
+		const short = tool.execute("status-short", { task, model: "_fixture_status_short_", access: "read-only" }, undefined, undefined, uiCtx);
+		const long = tool.execute("status-long", { task, model: "_fixture_status_long_", access: "read-only" }, undefined, undefined, uiCtx);
+		await short;
+		assert.match(statuses.at(-1) ?? "", /^Subagent \d+s · 0 turns · 1 active$/);
+		assert.equal(statuses.filter((text) => text === undefined).length, 0);
+		await long;
+		assert.equal(statuses.at(-1), undefined);
+	});
 
 	await t.test("schema makes optional selections strict", () => {
 		const schema = tool.parameters as TSchema;
@@ -1413,19 +1449,19 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 	await t.test("renders the requested model and skill count in the header", () => {
 		const component = tool.renderCall!({ task, model: " haiku ", thinking: "high", skills: ["review", "tests"] }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[haiku\] \[thinking: high\] \+2 skills/);
+		assert.match(text, /subagent Find all test files \[workspace-write\] \[haiku high\] \+2 skills/);
 	});
 
 	await t.test("renders explicit read-only access in the header", () => {
 		const component = tool.renderCall!({ task, access: "read-only" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: read-only\]/);
+		assert.match(text, /subagent Find all test files \[read-only\]/);
 	});
 
 	await t.test("renders repository-read access and the GitHub capability in the header", () => {
 		const component = tool.renderCall!({ task, access: "repository-read", githubRead: true }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: repository-read\] \[GitHub read\]/);
+		assert.match(text, /subagent Find all test files \[repository-read\] \[GitHub read\]/);
 	});
 
 	await t.test("renders calls without a model and partial arguments", () => {
@@ -1440,19 +1476,19 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 	await t.test("renders the requested deadline and turn limit", () => {
 		const component = tool.renderCall!({ task, timeoutMs: 15_000, maxTurns: 24 }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[timeout: 15000ms\] \[max turns: 24\]/);
+		assert.match(text, /subagent Find all test files \[workspace-write\] \[timeout: 15s\] \[max turns: 24\]/);
 	});
 
 	await t.test("renders allowed-path contract counts", () => {
 		const component = tool.renderCall!({ task, allowedPaths: ["src/**", "test/*.test.ts"], pathContractMode: "strict", completionFormat: "structured" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[allowed paths: 2\] \[strict paths\] \[structured completion\]/);
+		assert.match(text, /subagent Find all test files \[workspace-write\] \[allowed paths: 2\] \[strict paths\] \[structured completion\]/);
 	});
 
 	await t.test("renders thinking without a model", () => {
 		const component = tool.renderCall!({ task, thinking: "off" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[thinking: off\]/);
+		assert.match(text, /subagent Find all test files \[workspace-write\] \[off\]/);
 		assert.doesNotMatch(text, /undefined/);
 	});
 

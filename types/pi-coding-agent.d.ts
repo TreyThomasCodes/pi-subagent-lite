@@ -30,6 +30,9 @@ declare module "@earendil-works/pi-coding-agent" {
 	export interface ToolContext {
 		cwd: string;
 		hasUI: boolean;
+		ui: {
+			setStatus(key: string, text?: string): void;
+		};
 	}
 
 	export interface ExtensionAPI {
