@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added opt-in structured completion envelopes with validated `completed`, `blocked`, and `needs-replan` routing states plus explicit verification evidence.
+- Added `pathContractMode: "strict"` to fail a tool call when Git observation finds out-of-contract changes or cannot establish compliance, without claiming sandboxing or rollback.
 - Replaced the arbitrary 1,000,000-character protocol-record failure with a configurable 16,777,216-character default, incremental bounded parsing, accurate per-record diagnostics, recovery when a later valid final response arrives, and explicit failure for malformed output that never yields a final response.
 - Added `repository-read` access with fixed structured Git status/diff/show/log wrappers and opt-in GitHub issue/pull-request views, without exposing arbitrary shell, Git, or `gh` commands.
 - Added optional `allowedPaths` workspace-write contracts with bounded Git-based net-change reports, nested-cwd support, explicit unavailable/partial diagnostics, and out-of-scope path flags; reports are observational and do not sandbox or roll back writes.

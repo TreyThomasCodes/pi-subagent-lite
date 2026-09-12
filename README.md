@@ -97,6 +97,8 @@ For a bounded implementation task with skills:
   "task": "Objective: fix the confirmed stale-session bug.\nScope: src/auth.ts and test/auth.test.ts.\nAccess expectations: modify only those files.\nExclusions: no dependency, configuration, or public API changes.\nVerification: run the focused auth test command and report its exact outcome.\nStopping conditions: stop and report a blocker if the fix requires broader schema or API changes.\nReport format: changed files, implementation summary, commands actually run with outcomes, blockers, and uncertainty.",
   "access": "workspace-write",
   "allowedPaths": ["src/auth.ts", "test/auth.test.ts"],
+  "pathContractMode": "strict",
+  "completionFormat": "structured",
   "timeoutMs": 600000,
   "skills": ["code-review"]
 }
@@ -150,6 +152,34 @@ This is a local coordination guard, not a filesystem lock or sandbox. It cannot 
 The extension snapshots Git-tracked, staged, and non-ignored untracked files immediately before and after the child. It returns a structured `workspaceChanges` detail and an appended human-readable report with the observed changed paths and any paths outside the contract. The report is attached to normal results and to child failures, timeouts, and cancellations. Rename-like changes are reported as their removed and added paths; the tool does not infer a rename operation.
 
 This is **observational**, not a sandbox or rollback mechanism: a violating child is not stopped, writes are not reverted, ignored files are not inventoried, and concurrent external changes cannot be attributed with certainty. Git must be available and the cwd must be inside a usable worktree. If discovery or the bounded snapshot cannot run, the result explicitly says the observation is `unavailable` or `partial` rather than claiming scope enforcement. Large files, very large worktrees, and Gitlink/submodule directory contents are likewise reported as incomplete rather than read without limit.
+
+Set `pathContractMode` to `strict` when the parent must not accept a run unless observation establishes that every changed path is allowed. Strict mode turns both `violated` and `unknown` contract states into failed tool results after the child exits. The workspace-change report is included in the error. Strict mode remains an acceptance gate, not a filesystem sandbox: it does not stop the child while it runs or revert any edits.
+
+### Receiving a structured completion
+
+Set `completionFormat` to `structured` when an orchestrator needs to route the result without interpreting free-form prose. The child is instructed to return a small JSON envelope, which the extension validates and exposes as `details.completion`:
+
+```json
+{
+  "schemaVersion": 1,
+  "status": "completed",
+  "summary": "Implemented the bounded task",
+  "verification": {
+    "status": "passed",
+    "checks": [
+      {
+        "command": "npm test -- --test-name-pattern auth",
+        "status": "passed",
+        "evidence": "14 tests passed"
+      }
+    ]
+  }
+}
+```
+
+Completion `status` is `completed`, `blocked`, or `needs-replan`. `blocked` means an environmental, tool, or external-dependency impediment left an otherwise valid task unfinished. `needs-replan` means the supplied scope, contract, allowed paths, or dependencies require parent judgment. Both require a non-empty `blocker`. Verification is independent and reports `passed`, `failed`, or `not-run`, with the exact checks actually attempted.
+
+The default remains `text`. Structured completion is an LLM response protocol rather than a correctness guarantee: the extension rejects malformed or internally inconsistent envelopes, but the parent must still review the evidence and workspace state.
 
 ### Setting a deadline
 
@@ -208,6 +238,8 @@ Or specify it in a `subagent` tool call, with or without skills:
 | `thinking` | `"off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` | No | Child thinking level, passed via `--thinking` and displayed beside the model |
 | `timeoutMs` | `integer` | No | Maximum child runtime in milliseconds, from `1000` through `86400000`; omitted means no extension-imposed deadline |
 | `allowedPaths` | `string[]` | No | Cwd-relative glob-like patterns observed for net Git changes; workspace-write only. Reports violations but does not sandbox or revert them. |
+| `pathContractMode` | `"observe" \| "strict"` | No | Defaults to `observe`. `strict` fails when the observed contract is violated or unknown; it still does not sandbox or revert writes. |
+| `completionFormat` | `"text" \| "structured"` | No | Defaults to `text`. `structured` validates and returns a routing-oriented completion envelope in `details.completion`. |
 | `skills` | `string[]` | No | Optional skill paths or names to load via `--skill` |
 
 ## License
