@@ -43,6 +43,14 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 const ACCESS_MODES = ["read-only", "repository-read", "workspace-write"] as const;
 type AccessMode = (typeof ACCESS_MODES)[number];
+const PATH_CONTRACT_MODES = ["observe", "strict"] as const;
+type PathContractMode = (typeof PATH_CONTRACT_MODES)[number];
+const COMPLETION_FORMATS = ["text", "structured"] as const;
+type CompletionFormat = (typeof COMPLETION_FORMATS)[number];
+const COMPLETION_STATUSES = ["completed", "blocked", "needs-replan"] as const;
+type CompletionStatus = (typeof COMPLETION_STATUSES)[number];
+const VERIFICATION_STATUSES = ["passed", "failed", "not-run"] as const;
+type VerificationStatus = (typeof VERIFICATION_STATUSES)[number];
 const DEFAULT_ACCESS_MODE: AccessMode = "workspace-write";
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
 const REPOSITORY_GIT_TOOLS = ["repository_git_status", "repository_git_diff", "repository_git_show", "repository_git_log"] as const;
@@ -116,6 +124,23 @@ type WorkspaceObservation = {
 type SubagentRunResult = {
 	output: string;
 	workspaceChanges?: WorkspaceChangeReport;
+	completion?: StructuredCompletion;
+};
+type VerificationCheck = {
+	command: string;
+	status: VerificationStatus;
+	evidence?: string;
+};
+type StructuredCompletion = {
+	schemaVersion: 1;
+	status: CompletionStatus;
+	summary: string;
+	verification: {
+		status: VerificationStatus;
+		checks: VerificationCheck[];
+	};
+	blocker?: string;
+	uncertainty?: string;
 };
 
 function normalizeAllowedPaths(allowedPaths: string[] | undefined): string[] | undefined {
@@ -578,19 +603,89 @@ function appendWorkspaceChangeReportToError(error: unknown, report: WorkspaceCha
 	return new Error(`${message}\n\n${formatWorkspaceChangeReport(report)}`);
 }
 
-function getMinimalSystemPrompt(access: AccessMode, allowedPaths?: string[], githubRead = false): string {
+function parseStructuredCompletion(output: string): StructuredCompletion {
+	let candidate = output.trim();
+	const fenced = candidate.match(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i);
+	if (fenced) candidate = fenced[1].trim();
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(candidate);
+	} catch {
+		throw new Error("Structured completion protocol violation: final response must be one JSON object (an optional single json code fence is accepted)");
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("Structured completion protocol violation: final response must be a JSON object");
+	}
+	const value = parsed as Record<string, unknown>;
+	if (value.schemaVersion !== 1 || !COMPLETION_STATUSES.includes(value.status as CompletionStatus) || typeof value.summary !== "string" || !value.summary.trim()) {
+		throw new Error("Structured completion protocol violation: schemaVersion, status, or summary is invalid");
+	}
+	const verification = value.verification;
+	if (!verification || typeof verification !== "object" || Array.isArray(verification)) {
+		throw new Error("Structured completion protocol violation: verification must be an object");
+	}
+	const verificationValue = verification as Record<string, unknown>;
+	if (!VERIFICATION_STATUSES.includes(verificationValue.status as VerificationStatus) || !Array.isArray(verificationValue.checks)) {
+		throw new Error("Structured completion protocol violation: verification status or checks is invalid");
+	}
+	for (const check of verificationValue.checks) {
+		if (!check || typeof check !== "object" || Array.isArray(check)) {
+			throw new Error("Structured completion protocol violation: each verification check must be an object");
+		}
+		const checkValue = check as Record<string, unknown>;
+		if (typeof checkValue.command !== "string" || !checkValue.command.trim() || !VERIFICATION_STATUSES.includes(checkValue.status as VerificationStatus)) {
+			throw new Error("Structured completion protocol violation: each verification check requires a command and valid status");
+		}
+		if (checkValue.evidence !== undefined && typeof checkValue.evidence !== "string") {
+			throw new Error("Structured completion protocol violation: verification evidence must be a string when present");
+		}
+	}
+	const checkStatuses = verificationValue.checks.map((check) => (check as Record<string, unknown>).status as VerificationStatus);
+	if (verificationValue.status === "passed" && (checkStatuses.length === 0 || checkStatuses.some((status) => status !== "passed"))) {
+		throw new Error("Structured completion protocol violation: passed verification requires at least one check and every check must have passed");
+	}
+	if (verificationValue.status === "failed" && !checkStatuses.includes("failed")) {
+		throw new Error("Structured completion protocol violation: failed verification requires at least one failed check");
+	}
+	if (verificationValue.status === "not-run" && checkStatuses.some((status) => status !== "not-run")) {
+		throw new Error("Structured completion protocol violation: not-run verification cannot contain a passed or failed check");
+	}
+	for (const field of ["blocker", "uncertainty"] as const) {
+		if (value[field] !== undefined && typeof value[field] !== "string") {
+			throw new Error(`Structured completion protocol violation: ${field} must be a string when present`);
+		}
+	}
+	if ((value.status === "blocked" || value.status === "needs-replan") && (typeof value.blocker !== "string" || !value.blocker.trim())) {
+		throw new Error(`Structured completion protocol violation: status ${value.status} requires a non-empty blocker`);
+	}
+	if (value.status === "completed" && value.blocker !== undefined) {
+		throw new Error("Structured completion protocol violation: completed status cannot include a blocker");
+	}
+	return parsed as StructuredCompletion;
+}
+
+function getMinimalSystemPrompt(
+	access: AccessMode,
+	allowedPaths?: string[],
+	githubRead = false,
+	pathContractMode: PathContractMode = "observe",
+	completionFormat: CompletionFormat = "text",
+): string {
 	const accessGuidance = access === "read-only"
 		? "You are in read-only access mode. Use only the available non-mutating tools and do not modify the workspace."
 		: access === "repository-read"
 			? `You are in repository-read access mode. Use only the available non-mutating filesystem and structured repository tools; shell, edit, and write tools are unavailable. Git${githubRead ? " and GitHub issue/pull-request" : ""} operations are fixed, parameterized read operations, not an arbitrary command interface. Do not modify the workspace or attempt to work around this boundary.`
 			: "You are in workspace-write access mode. You may use the available tools to inspect and modify the workspace as the task requires.";
 	const contractGuidance = allowedPaths
-		? `\nAn observational allowed-path contract applies: ${allowedPaths.map((value) => JSON.stringify(value)).join(", ") || "no changes are allowed"}. Keep edits within that contract. The parent reports net observed Git changes after the run; this is not a sandbox and does not undo edits.\n`
+		? `\nA ${pathContractMode === "strict" ? "strict parent-side acceptance" : "observational"} allowed-path contract applies: ${allowedPaths.map((value) => JSON.stringify(value)).join(", ") || "no changes are allowed"}. Keep edits within that contract. The parent reports net observed Git changes after the run; this is not a sandbox and does not undo edits.${pathContractMode === "strict" ? " The tool call fails after the run if observation finds an out-of-contract path or cannot establish compliance." : ""}\n`
+		: "";
+	const completionGuidance = completionFormat === "structured"
+		? `\nYour final response must contain only this JSON object (a single json code fence is tolerated):\n{\n  "schemaVersion": 1,\n  "status": "completed" | "blocked" | "needs-replan",\n  "summary": "concise result",\n  "verification": {\n    "status": "passed" | "failed" | "not-run",\n    "checks": [{ "command": "exact command", "status": "passed" | "failed" | "not-run", "evidence": "concise outcome" }]\n  },\n  "blocker": "required when blocked or needs-replan",\n  "uncertainty": "optional material uncertainty"\n}\nUse blocked for an environmental, tool, or external-dependency impediment that does not invalidate the task packet. Use needs-replan when the supplied scope, contract, allowed paths, or dependencies are insufficient or contradictory and require parent judgment. Use completed only when the requested implementation or analysis is done; verification is reported independently and must reflect checks actually run. Omit optional fields rather than inventing content.\n`
 		: "";
 
 	return `You are a subagent running in an isolated pi process.
 
-${accessGuidance}${contractGuidance}
+${accessGuidance}${contractGuidance}${completionGuidance}
 Your job is to focus exclusively on the assigned task, use tools as needed, and provide a concise, evidence-based final report.
 
 Guidelines:
@@ -1224,6 +1319,8 @@ async function runSubagent(
 	thinking?: ThinkingLevel,
 	timeoutMs?: number,
 	allowedPaths?: string[],
+	pathContractMode: PathContractMode = "observe",
+	completionFormat: CompletionFormat = "text",
 	githubRead?: boolean,
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult) => void,
@@ -1234,6 +1331,9 @@ async function runSubagent(
 	const normalizedAllowedPaths = normalizeAllowedPaths(allowedPaths);
 	if (normalizedAllowedPaths !== undefined && access !== "workspace-write") {
 		throw new Error("allowedPaths is only supported with access: \"workspace-write\"");
+	}
+	if (pathContractMode === "strict" && normalizedAllowedPaths === undefined) {
+		throw new Error("pathContractMode: \"strict\" requires allowedPaths");
 	}
 	if (githubRead !== undefined && typeof githubRead !== "boolean") throw new Error("githubRead must be a boolean");
 	if (githubRead !== undefined && access !== "repository-read") throw new Error("githubRead is only supported with access: \"repository-read\"");
@@ -1285,6 +1385,8 @@ async function runSubagent(
 			timeoutMs !== undefined && `timeout: ${timeoutMs}ms`,
 			githubRead && "GitHub read enabled",
 			normalizedAllowedPaths !== undefined && `allowed paths: ${normalizedAllowedPaths.length}`,
+			pathContractMode === "strict" && "strict path contract",
+			completionFormat === "structured" && "structured completion",
 		].filter(Boolean).join(", ");
 		onUpdate?.({
 			content: [{ type: "text", text: `Subagent running (${selection})...` }],
@@ -1292,7 +1394,11 @@ async function runSubagent(
 
 		tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 		const promptFile = path.join(tmpDir, "prompt.md");
-		await fs.promises.writeFile(promptFile, getMinimalSystemPrompt(access, normalizedAllowedPaths, githubRead), { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(
+			promptFile,
+			getMinimalSystemPrompt(access, normalizedAllowedPaths, githubRead, pathContractMode, completionFormat),
+			{ encoding: "utf-8", mode: 0o600 },
+		);
 		args.push("--append-system-prompt", promptFile);
 
 		if (task.length > MAX_TASK_ARG_LENGTH) {
@@ -1491,7 +1597,15 @@ async function runSubagent(
 		if (failure) throw new SubagentRecoveryError(diagnosticDetail(failure), buildRecoveryDiagnostics("abnormal-exit"));
 
 		const report = await finishWorkspaceObservation();
-		return { output: appendWorkspaceChangeReport(lastAssistantText, report), workspaceChanges: report };
+		if (pathContractMode === "strict" && report?.contractStatus !== "within-observed-scope") {
+			const reason = report?.contractStatus === "violated"
+				? `out-of-contract paths were observed: ${report.outsideAllowedPaths.map((value) => JSON.stringify(value)).join(", ")}`
+				: "workspace observation could not establish compliance";
+			throw new Error(`Strict allowed-path contract failed: ${reason}`);
+		}
+		const completion = completionFormat === "structured" ? parseStructuredCompletion(lastAssistantText) : undefined;
+		const resultText = completion ? JSON.stringify(completion, null, 2) : lastAssistantText;
+		return { output: appendWorkspaceChangeReport(resultText, report), workspaceChanges: report, completion };
 	} catch (error) {
 		const report = await finishWorkspaceObservation();
 		throw appendWorkspaceChangeReportToError(error, report);
@@ -1645,6 +1759,16 @@ const SubagentParams = Type.Object({
 			maxItems: MAX_ALLOWED_PATHS,
 		}),
 	),
+	pathContractMode: Type.Optional(
+		Type.Union(PATH_CONTRACT_MODES.map((mode) => Type.Literal(mode)), {
+			description: "How to treat allowedPaths observations. observe reports the result; strict fails the tool call when out-of-contract changes are observed or compliance cannot be established. Strict mode does not sandbox or roll back writes.",
+		}),
+	),
+	completionFormat: Type.Optional(
+		Type.Union(COMPLETION_FORMATS.map((format) => Type.Literal(format)), {
+			description: "Child completion format. text preserves the existing prose response; structured requests and validates a small JSON completion envelope for deterministic parent routing.",
+		}),
+	),
 	skills: Type.Optional(
 		Type.Array(Type.String({ description: "Skill path or name to load via --skill" }), {
 			description: "Optional startup skills to load into the subagent process",
@@ -1680,7 +1804,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise report when its work is done. A successful tool result is provisional: it is not proof that tests passed or that the parent should accept the work. repository-read adds fixed Git read operations and optional GitHub issue/pull-request views without arbitrary shell access; it is a tool boundary, not an OS sandbox. Optional allowedPaths contracts report bounded Git-observed net changes and out-of-scope paths without sandboxing or rolling back writes. Select an access mode and optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
+		description: "Delegate tasks to fresh pi subagents with isolated context windows. Read-only calls and workspace-write calls using different working directories may run in parallel; a second workspace-write call for the same working directory is rejected while the first is active. Each subagent returns a concise report when its work is done. A successful tool result is provisional: it is not proof that tests passed or that the parent should accept the work. repository-read adds fixed Git read operations and optional GitHub issue/pull-request views without arbitrary shell access; it is a tool boundary, not an OS sandbox. Optional allowedPaths contracts report bounded Git-observed net changes and out-of-scope paths without sandboxing or rolling back writes; strict path-contract mode turns violations or unknown scope into failed tool results. Structured completion mode validates a small routing envelope while preserving text completion by default. Select an access mode and optional runtime deadline per call; workspace-write with no deadline is the compatibility default. A model and thinking level can be selected per call, and optional startup skills can be preloaded. Use subagent_models to compare the child runtime's live selectors, capabilities, limits, and configured cost metadata before selecting one in a fresh session.",
 		promptSnippet: "Delegate a bounded task and receive a provisional report",
 		promptGuidelines: [
 			"Delegate non-trivial, self-contained tasks to subagents so you can stay focused on the overall picture.",
@@ -1689,6 +1813,8 @@ export default function (pi: ExtensionAPI) {
 			"Parallelize read-only work freely, but run at most one workspace-write subagent per working directory at a time; a concurrent same-directory writer is rejected rather than queued.",
 			"repository-read exposes only fixed structured Git operations plus optional GitHub issue/pull-request views. It does not expose a shell or arbitrary command arguments, but it is a tool boundary rather than an operating-system sandbox and inherits ordinary child environment/credential visibility.",
 			"For workspace-write tasks, allowedPaths can report Git-observed net changes against cwd-relative patterns. It is observational only: it does not sandbox, stop, or roll back a violating child, and unavailable Git observation must be treated as unknown scope.",
+			"Use pathContractMode: \"strict\" when an out-of-contract change or unknown observation must fail the call. Strict mode is an acceptance gate, not a sandbox or rollback mechanism.",
+			"Use completionFormat: \"structured\" when the parent must distinguish completed work, worker blockers, and task packets that need replanning without interpreting prose.",
 			"Before selecting a subagent model in a fresh session, use subagent_models. Select from its live catalog based on the task's concrete needs; do not guess selectors or assume the parent model is available to the child.",
 		],
 		parameters: SubagentParams,
@@ -1704,13 +1830,17 @@ export default function (pi: ExtensionAPI) {
 				params.thinking,
 				params.timeoutMs,
 				params.allowedPaths,
+				params.pathContractMode,
+				params.completionFormat,
 				params.githubRead,
 				signal,
 				onUpdate,
 			);
 			return {
 				content: [{ type: "text", text: output.output || "(no output)" }],
-				details: output.workspaceChanges ? { workspaceChanges: output.workspaceChanges } : undefined,
+				details: output.workspaceChanges || output.completion
+					? { workspaceChanges: output.workspaceChanges, completion: output.completion }
+					: undefined,
 			};
 		},
 
@@ -1726,6 +1856,8 @@ export default function (pi: ExtensionAPI) {
 			if (args.timeoutMs !== undefined) text += ` ${theme.fg("accent", `[timeout: ${args.timeoutMs}ms]`)}`;
 			if (args.githubRead) text += ` ${theme.fg("accent", "[GitHub read]")}`;
 			if (args.allowedPaths !== undefined) text += ` ${theme.fg("accent", `[allowed paths: ${args.allowedPaths.length}]`)}`;
+			if (args.pathContractMode === "strict") text += ` ${theme.fg("accent", "[strict paths]")}`;
+			if (args.completionFormat === "structured") text += ` ${theme.fg("accent", "[structured completion]")}`;
 			const skillsArr = args.skills ?? [];
 			if (skillsArr.length > 0) {
 				text += ` ${theme.fg("accent", `+${skillsArr.length} skills`)}`;

@@ -13,7 +13,7 @@ import { Value } from "@sinclair/typebox/value";
 import registerSubagent, { classifyRepositoryReadFailure, registerRepositoryReadTools } from "../index.js";
 
 type SubagentTool = Parameters<ExtensionAPI["registerTool"]>[0];
-type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; allowedPaths?: string[]; githubRead?: boolean; skills?: string[] };
+type SubagentInput = { task: string; model?: string; thinking?: string; access?: string; timeoutMs?: number; allowedPaths?: string[]; pathContractMode?: string; completionFormat?: string; githubRead?: boolean; skills?: string[] };
 const execFileAsync = promisify(execFile);
 type Invocation = { args: string[]; cwd: string; disabled: string; repositoryRead?: string; githubRead?: string; prompt: string; task: string; thinking?: string; tools?: string };
 
@@ -177,6 +177,39 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
     const staged = spawnSync("git", ["add", "tracked.ts"]);
     if (staged.status !== 0) throw new Error("Could not stage fixture change");
     emit({ role: "assistant", content: [{ type: "text", text: "Staged a tracked file" }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_completed_") {
+    emit({ role: "assistant", content: [{ type: "text", text: JSON.stringify({
+      schemaVersion: 1,
+      status: "completed",
+      summary: "Implemented the bounded task",
+      verification: { status: "passed", checks: [{ command: "npm test", status: "passed", evidence: "42 tests passed" }] },
+    }) }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_replan_") {
+    const fence = String.fromCharCode(96).repeat(3);
+    emit({ role: "assistant", content: [{ type: "text", text: fence + 'json\n' + JSON.stringify({
+      schemaVersion: 1,
+      status: "needs-replan",
+      summary: "The supplied contract cannot express the requested behavior",
+      verification: { status: "not-run", checks: [] },
+      blocker: "The allowed interface lacks the required operation",
+    }) + '\n' + fence }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_blocked_") {
+    emit({ role: "assistant", content: [{ type: "text", text: JSON.stringify({
+      schemaVersion: 1,
+      status: "blocked",
+      summary: "The required SDK is unavailable",
+      verification: { status: "not-run", checks: [] },
+      blocker: "The required SDK is not installed in the child environment",
+    }) }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_verification_failed_") {
+    emit({ role: "assistant", content: [{ type: "text", text: JSON.stringify({
+      schemaVersion: 1,
+      status: "completed",
+      summary: "Implemented the requested change but its focused test fails",
+      verification: { status: "failed", checks: [{ command: "npm test", status: "failed", evidence: "one assertion failed" }] },
+    }) }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_invalid_") {
+    emit({ role: "assistant", content: [{ type: "text", text: "I completed the work." }], stopReason: "stop" });
   } else {
     if (model === "_fixture_recovered_") {
       emit({ role: "assistant", content: [], stopReason: "error", errorMessage: "Transient provider failure" });
@@ -204,7 +237,7 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
 }
 `;
 
-test("subagent model selection", { timeout: 30_000 }, async (t) => {
+test("subagent model selection", { timeout: 45_000 }, async (t) => {
 	const fixtureDir = await mkdtemp(join(tmpdir(), "subagent-model-test-"));
 	const originalScript = process.argv[1];
 	const originalDisabled = process.env.PI_SUBAGENT_LITE_DISABLE;
@@ -338,6 +371,8 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.match(tool.description, /allowedPaths.*Git-observed.*without sandboxing/i);
 		assert.match(guidelines, /objective.*scope.*access expectations.*exclusions.*verification.*stopping conditions.*report format/i);
 		assert.match(guidelines, /allowedPaths.*observational.*unknown scope/i);
+		assert.match(guidelines, /pathContractMode.*strict.*acceptance gate.*not a sandbox/i);
+		assert.match(guidelines, /completionFormat.*structured.*completed work.*worker blockers.*replanning/i);
 		assert.match(guidelines, /successful subagent result.*provisional report.*not proof.*tests passed.*accepted/i);
 	});
 
@@ -418,6 +453,11 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 		assert.equal(Value.Check(schema, { task, timeoutMs: 86_400_000 }), true);
 		assert.equal(Value.Check(schema, { task, allowedPaths: ["src/**", "README.md"] }), true);
 		assert.equal(Value.Check(schema, { task, allowedPaths: [] }), true);
+		assert.equal(Value.Check(schema, { task, allowedPaths: ["src/**"], pathContractMode: "strict" }), true);
+		assert.equal(Value.Check(schema, { task, pathContractMode: "observe" }), true);
+		assert.equal(Value.Check(schema, { task, pathContractMode: "enforce" }), false);
+		assert.equal(Value.Check(schema, { task, completionFormat: "structured" }), true);
+		assert.equal(Value.Check(schema, { task, completionFormat: "json" }), false);
 		assert.equal(Value.Check(schema, { task, allowedPaths: [""] }), false);
 		assert.equal(Value.Check(schema, { task, allowedPaths: "src/**" }), false);
 		for (const timeoutMs of [999, 86_400_001, 1_000.5, "1000", null]) {
@@ -450,6 +490,106 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 			rm(join(contractWorkspace, "allowed"), { recursive: true, force: true }),
 			rm(join(contractWorkspace, "outside.txt"), { force: true }),
 		]);
+	});
+
+	await t.test("strict path contracts pass only when observation establishes compliance", async () => {
+		const clean = await tool.execute(
+			"strict-scope-clean",
+			{ task, model: "_fixture_scope_inside_", allowedPaths: ["allowed/**"], pathContractMode: "strict" },
+			undefined,
+			undefined,
+			contractCtx,
+		);
+		assert.equal(getWorkspaceChanges(clean).contractStatus, "within-observed-scope");
+		await rm(join(contractWorkspace, "allowed"), { recursive: true, force: true });
+
+		await assert.rejects(
+			tool.execute(
+				"strict-scope-violated",
+				{ task, model: "_fixture_scope_mixed_", allowedPaths: ["allowed/**"], pathContractMode: "strict" },
+				undefined,
+				undefined,
+				contractCtx,
+			),
+			/Strict allowed-path contract failed: out-of-contract paths were observed:[\s\S]*Workspace change report \(observational\):[\s\S]*contract: violated/,
+		);
+		await Promise.all([
+			rm(join(contractWorkspace, "allowed"), { recursive: true, force: true }),
+			rm(join(contractWorkspace, "outside.txt"), { force: true }),
+		]);
+
+		await assert.rejects(
+			tool.execute(
+				"strict-scope-unknown",
+				{ task, allowedPaths: ["src/**"], pathContractMode: "strict" },
+				undefined,
+				undefined,
+				{ ...ctx, cwd: otherCwd },
+			),
+			/Strict allowed-path contract failed: workspace observation could not establish compliance/,
+		);
+		await assert.rejects(
+			tool.execute("strict-without-paths", { task, pathContractMode: "strict" }, undefined, undefined, ctx),
+			/pathContractMode: "strict" requires allowedPaths/,
+		);
+	});
+
+	await t.test("structured completion exposes deterministic routing details", async () => {
+		const completed = await tool.execute(
+			"structured-completed",
+			{ task, model: "_fixture_structured_completed_", completionFormat: "structured" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const completedDetails = completed.details as { completion?: { status: string; verification: { status: string } } } | undefined;
+		assert.equal(completedDetails?.completion?.status, "completed");
+		assert.equal(completedDetails?.completion?.verification.status, "passed");
+		assert.match(completed.content[0].text, /"status": "completed"/);
+
+		const replan = await tool.execute(
+			"structured-replan",
+			{ task, model: "_fixture_structured_replan_", completionFormat: "structured" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const replanDetails = replan.details as { completion?: { status: string; blocker?: string } } | undefined;
+		assert.equal(replanDetails?.completion?.status, "needs-replan");
+		assert.match(replanDetails?.completion?.blocker ?? "", /allowed interface/);
+
+		const blocked = await tool.execute(
+			"structured-blocked",
+			{ task, model: "_fixture_structured_blocked_", completionFormat: "structured" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const blockedDetails = blocked.details as { completion?: { status: string; blocker?: string } } | undefined;
+		assert.equal(blockedDetails?.completion?.status, "blocked");
+		assert.match(blockedDetails?.completion?.blocker ?? "", /SDK is not installed/);
+
+		const verificationFailed = await tool.execute(
+			"structured-verification-failed",
+			{ task, model: "_fixture_structured_verification_failed_", completionFormat: "structured" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const failedDetails = verificationFailed.details as { completion?: { status: string; verification: { status: string } } } | undefined;
+		assert.equal(failedDetails?.completion?.status, "completed");
+		assert.equal(failedDetails?.completion?.verification.status, "failed");
+
+		await assert.rejects(
+			tool.execute(
+				"structured-invalid",
+				{ task, model: "_fixture_structured_invalid_", completionFormat: "structured" },
+				undefined,
+				undefined,
+				ctx,
+			),
+			/Structured completion protocol violation/,
+		);
 	});
 
 	await t.test("passes an allowed-path contract to the child and reports a clean net diff", async () => {
@@ -1111,9 +1251,9 @@ test("subagent model selection", { timeout: 30_000 }, async (t) => {
 	});
 
 	await t.test("renders allowed-path contract counts", () => {
-		const component = tool.renderCall!({ task, allowedPaths: ["src/**", "test/*.test.ts"] }, theme, renderContext);
+		const component = tool.renderCall!({ task, allowedPaths: ["src/**", "test/*.test.ts"], pathContractMode: "strict", completionFormat: "structured" }, theme, renderContext);
 		const text = stripVTControlCharacters(component.render(300).join("\n"));
-		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[allowed paths: 2\]/);
+		assert.match(text, /subagent Find all test files \[access: workspace-write\] \[allowed paths: 2\] \[strict paths\] \[structured completion\]/);
 	});
 
 	await t.test("renders thinking without a model", () => {
