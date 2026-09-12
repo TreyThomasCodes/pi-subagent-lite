@@ -184,6 +184,14 @@ if (args.includes("--mode") && args[args.indexOf("--mode") + 1] === "rpc") {
       summary: "Implemented the bounded task",
       verification: { status: "passed", checks: [{ command: "npm test", status: "passed", evidence: "42 tests passed" }] },
     }) }], stopReason: "stop" });
+  } else if (model === "_fixture_structured_prose_fence_") {
+    const fence = String.fromCharCode(96).repeat(3);
+    emit({ role: "assistant", content: [{ type: "text", text: "Work complete.\n\n" + fence + 'json\n' + JSON.stringify({
+      schemaVersion: 1,
+      status: "completed",
+      summary: "Implemented despite incidental prose",
+      verification: { status: "passed", checks: [{ command: "npm test", status: "passed", evidence: "42 tests passed" }] },
+    }) + '\n' + fence + "\n\nAdditional explanation." }], stopReason: "stop" });
   } else if (model === "_fixture_structured_replan_") {
     const fence = String.fromCharCode(96).repeat(3);
     emit({ role: "assistant", content: [{ type: "text", text: fence + 'json\n' + JSON.stringify({
@@ -547,6 +555,17 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 		assert.equal(completedDetails?.completion?.verification.status, "passed");
 		assert.match(completed.content[0].text, /"status": "completed"/);
 
+		const proseFenced = await tool.execute(
+			"structured-prose-fence",
+			{ task, model: "_fixture_structured_prose_fence_", completionFormat: "structured" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const proseFencedDetails = proseFenced.details as { completion?: { status: string; summary: string } } | undefined;
+		assert.equal(proseFencedDetails?.completion?.status, "completed");
+		assert.match(proseFencedDetails?.completion?.summary ?? "", /incidental prose/);
+
 		const replan = await tool.execute(
 			"structured-replan",
 			{ task, model: "_fixture_structured_replan_", completionFormat: "structured" },
@@ -588,7 +607,22 @@ test("subagent model selection", { timeout: 45_000 }, async (t) => {
 				undefined,
 				ctx,
 			),
-			/Structured completion protocol violation/,
+			(error: Error) => {
+				assert.match(error.message, /Structured completion protocol violation/);
+				assert.match(error.message, /Unparsed final response:\\nI completed the work\./);
+				return true;
+			},
+		);
+
+		await assert.rejects(
+			tool.execute("structured-prompt-contract", { task, completionFormat: "structured" }, undefined, undefined, ctx),
+			(error: Error) => {
+				assert.match(error.message, /FINAL RESPONSE PROTOCOL/);
+				assert.match(error.message, /Your final response must be exactly one JSON object/);
+				assert.match(error.message, /Example of a valid completed response/);
+				assert.doesNotMatch(error.message, /\"completed\" \\| \"blocked\"/);
+				return true;
+			},
 		);
 	});
 
